@@ -162,16 +162,16 @@ where $`\mathbf{b}_1`$ holds the effects of the status levels and $`\mathbf{b}_2
 \qquad
 x_{i,j_1=1} =
 \begin{cases}
-\phantom{-}1 & \text{status } 0 \\
+1 & \text{status } 0 \\
 -1 & \text{status } 2 \\
-\phantom{-}0 & \text{status } 3
+0 & \text{status } 3
 \end{cases}
 \qquad
 x_{i,j_1=2} =
 \begin{cases}
-\phantom{-}0 & \text{status } 0 \\
+0 & \text{status } 0 \\
 -1 & \text{status } 2 \\
-\phantom{-}1 & \text{status } 3
+1 & \text{status } 3
 \end{cases}
 ```
 
@@ -182,15 +182,15 @@ x_{i,j_1=2} =
 \qquad
 x_{i,j_2=1} =
 \begin{cases}
-\phantom{-}1 & \text{parity } 1 \\
-\phantom{-}0 & \text{parity } 2 \\
+1 & \text{parity } 1 \\
+0 & \text{parity } 2 \\
 -1 & \text{parity } 3
 \end{cases}
 \qquad
 x_{i,j_2=2} =
 \begin{cases}
-\phantom{-}0 & \text{parity } 1 \\
-\phantom{-}1 & \text{parity } 2 \\
+0 & \text{parity } 1 \\
+1 & \text{parity } 2 \\
 -1 & \text{parity } 3
 \end{cases}
 ```
@@ -367,8 +367,7 @@ To keep $`\mathbf{A}`$, $`\mathbf{G}`$ and $`\mathbf{y}`$ aligned, the rows and 
 \left(
 \begin{array}{cc|cc}
 \mathbf{A}_{11_{00}} & \mathbf{A}_{11_{01}} & \mathbf{A}_{12_{00}} & \mathbf{A}_{12_{01}} \\
-\mathbf{A}_{11_{10}} & \mathbf{A}_{11_{11}} & \mathbf{A}_{12_{10}} & \mathbf{A}_{12_{11}} \\
-\hline
+\mathbf{A}_{11_{10}} & \mathbf{A}_{11_{11}} & \mathbf{A}_{12_{10}} & \mathbf{A}_{12_{11}} \\ \hline
 \mathbf{A}_{21_{00}} & \mathbf{A}_{21_{01}} & \mathbf{A}_{22_{00}} & \mathbf{A}_{22_{01}} \\
 \mathbf{A}_{21_{10}} & \mathbf{A}_{21_{11}} & \mathbf{A}_{22_{10}} & \mathbf{A}_{22_{11}}
 \end{array}
