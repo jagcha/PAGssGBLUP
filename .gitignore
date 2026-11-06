@@ -1,0 +1,10 @@
+# Data are private and not part of the repository
+data/
+
+# Rendered output
+*.html
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
