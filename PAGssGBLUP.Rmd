@@ -1,0 +1,2467 @@
+---
+title: "ssGBLUP PAGs"
+author: "Agustín Chasco"
+date: "2026-11-04"
+output: html_document
+---
+
+# Phenotype data
+
+## Read phenotype data
+
+Each row of `fdf` is one cow. The cow is identified by `ID`, built as `'HO'` + `EID`, which is the ID used in the pedigree. This ID links the phenotypes with the pedigree and the genotypes.
+```{r}
+################################# Objective ####################################
+# Prepare phenotypes, genotypes and pedigree, and build the relationship
+# matrices for the ssGBLUP of delta PAGs.
+
+############################## Initialization ##################################
+rm(list = ls())
+
+# readxl is broken on this machine (binary built for R 4.3.3, running R 4.3.0),
+# so use openxlsx instead.
+library(openxlsx)
+library(readr)
+################################ Load Data #####################################
+path <- '../data/Main_Data.xlsx'
+fdf <- read.xlsx(path)
+
+# EID is the cow ID: convert to factor (sprintf avoids scientific notation).
+fdf$EID <- factor(sprintf("%.0f", fdf$EID))
+
+# Rename pregnancy columns to syntactic names (no "/").
+colnames(fdf)[colnames(fdf) == 'P/IA_D32'] <- 'PIA32'
+colnames(fdf)[colnames(fdf) == 'P/IA_60'] <- 'PIA60'
+
+# Animal ID of the cow, as in the pedigree: 'HO' + EID (e.g., HO840000000000000).
+fdf$ID <- paste0('HO', fdf$EID)
+fdf$EID <- NULL
+```
+
+## Trait: change in PAGs (`delta`)
+
+Change in PAGs between day 16 and day 26 (`PAGs_d26 - PAGs_d16`).
+```{r}
+################################ Get Trait #####################################
+fdf$delta <- fdf$PAGs_d26 - fdf$PAGs_d16
+summary(fdf$delta)
+```
+
+## Basic exploration of phenotype
+
+Number of unique cows.
+```{r}
+length(unique(fdf$ID))
+sum(duplicated(fdf$ID)) # 0 means one record per cow (no repeated records).
+stopifnot(!any(duplicated(fdf$ID)))
+```
+
+
+Frequency table of parity (lactation number). Parity enters the model as a fixed classification effect, so it is converted to a factor.
+```{r}
+fdf$PARITY <- factor(fdf$PARITY)
+table(fdf$PARITY)
+```
+
+
+Number of confirmed pregnancies at day 32 and day 60.
+```{r}
+table(fdf$PIA32)
+100*prop.table(table(fdf$PIA32))
+table(fdf$PIA60)
+100*prop.table(table(fdf$PIA60))
+```
+
+
+Number of observed pregnancy losses between day 32 and day 60.
+```{r}
+fdf$abdet <- ifelse(test = fdf$PIA32 == 1 & fdf$PIA60 == 0, yes = 1, no = 0)
+table(fdf$abdet)
+100*prop.table(table(fdf$abdet))
+```
+
+
+Number of sires (semen IDs).
+```{r}
+length(unique(fdf$SEMEN))
+table(fdf$SEMEN)
+```
+
+## Create `status` variable
+
+Status:
+
+- 0: animal was detected as pregnant neither at day 32 nor at day 60.
+
+- 1: animal was not detected as pregnant at day 32 but pregnancy was confirmed at day 60.
+
+- 2: animal was detected as pregnant at day 32 but pregnancy was not confirmed at day 60 (observed loss).
+
+- 3: animal was detected as pregnant at day 32 and confirmed pregnant at day 60.
+
+```{r}
+fdf$status <- NA
+fdf$status[fdf$PIA32 == 0 & fdf$PIA60 == 0] <- 0
+fdf$status[fdf$PIA32 == 0 & fdf$PIA60 == 1] <- 1
+fdf$status[fdf$PIA32 == 1 & fdf$PIA60 == 0] <- 2
+fdf$status[fdf$PIA32 == 1 & fdf$PIA60 == 1] <- 3
+# factor() keeps only the observed levels. Status 1 has no observations, so the
+# levels are 0, 2 and 3, which are the levels used in the model below.
+fdf$status <- factor(fdf$status)
+table(fdf$status)
+100*prop.table(table(fdf$status))
+```
+
+# Working model
+
+$$
+\begin{pmatrix}
+\mathbf{y}_1 \\
+\mathbf{y}_2
+\end{pmatrix} =
+\mathbf{X}
+\mathbf{b} +
+\begin{pmatrix}
+\mathbf{W}_1 & \mathbf{0} \\
+\mathbf{0} &  \mathbf{W}_2
+\end{pmatrix}
+\begin{pmatrix}
+\mathbf{a}_1 \\
+\mathbf{a}_2
+\end{pmatrix} +
+\mathbf{e}
+$$
+In compact matrix notation:
+$$
+\mathbf{y} = \mathbf{Xb} + \mathbf{Wa} + \mathbf{e}
+$$
+Where $\mathbf{y}$ is the vector of phenotypes (`delta`), $\mathbf{b}$ is the vector of fixed effects with design matrix $\mathbf{X}$, $\mathbf{a}$ is the vector of additive genetic effects with design matrix $\mathbf{W}$, and $\mathbf{e}$ is the vector of residuals. Subscript 1 refers to animals with pedigree but without genotype information, and subscript 2 to animals with pedigree and genotype information.
+
+The random effects are assumed independent, with $\mathbf{a} \sim N(\mathbf{0}, \mathbf{H}\sigma^2_a)$ and $\mathbf{e} \sim N(\mathbf{0}, \mathbf{I}\sigma^2_e)$, where $\mathbf{H}$ combines pedigree and genomic relationships (see Genomic information).
+
+The vector of phenotypes is:
+$$
+\begin{aligned}
+\mathbf{y} &= \begin{pmatrix}
+\mathbf{y}_1 \\
+\mathbf{y}_2
+\end{pmatrix}, \\
+\mathbf{y}_1 &\in \mathbb{R}^{n_{y_1} \times 1}, \\
+\mathbf{y}_2 &\in \mathbb{R}^{n_{y_2} \times 1}.
+\end{aligned}
+$$
+
+Where $n_{y_1}$ indicates the number of phenotypes measured in cows with pedigree but without genotype information, and $n_{y_2}$ the number of phenotypes measured in cows with pedigree and genotype information. Hence, $\mathbf{y}_1$ is the vector of observed phenotypes from cows with pedigree and without genotype information, and $\mathbf{y}_2$ is the vector of observed phenotypes from cows with pedigree and genotype information.
+
+
+## Fixed effects
+
+The design matrix of fixed effects is defined below.
+$$
+\mathbf{X} \in \mathbb{R}^{N \times p}
+$$
+Where $N = n_{y_1} + n_{y_2}$ indicates the total number of phenotypes, and $p$ indicates the total number of fixed-effect parameters (columns of $\mathbf{X}$).
+
+The vector of fixed effects is:
+$$
+\mathbf{b} \in \mathbb{R}^{p \times 1}
+$$
+
+In this application, I include as fixed effects an intercept $\mu$ and the factors `status` and `PARITY`.
+
+Then, the design matrix and the vector of fixed effects can be partitioned as:
+$$
+\mathbf{Xb} =
+\begin{pmatrix}
+\mathbf{1}_N & \mathbf{X}_1 & \mathbf{X}_2
+\end{pmatrix}
+\begin{pmatrix}
+\mu \\ \mathbf{b}_1 \\ \mathbf{b}_2
+\end{pmatrix} =
+\mathbf{1}_N \mu + \mathbf{X}_1 \mathbf{b}_1 + \mathbf{X}_2 \mathbf{b}_2
+$$
+
+Where $\mathbf{1}_N$ is a vector of ones of length $N$, $\mu$ is the intercept, $\mathbf{b}_1$ is the vector of fixed effects of the status levels, and $\mathbf{b}_2$ is the vector of fixed effects of the parity levels. Hence, $p = 1 + n_{b_1} + n_{b_2}$.
+
+If $\mathbf{X}$ had an intercept plus one column per level of each factor, its columns would be linearly dependent (for each factor, the level columns add up to $\mathbf{1}_N$). Then $\mathbf{X}$ would not have full column rank, and $\mathbf{X}^\top\mathbf{X}$, the fixed-effects block of the mixed model equations (MME), would be singular and could not be inverted (note that $\mathbf{X}$ itself is rectangular ($N \times p$) and is never inverted; what has to be non-singular is $\mathbf{X}^\top\mathbf{X}$ - and, with it, the coefficient matrix of the MME). Therefore, it is necessary to impose one constraint per factor. I will work with a sum-to-zero constraint: the effects of the levels of each factor add up to zero, the intercept $\mu$ is the unweighted mean of the level means, and the fixed effects are expressed as deviations from $\mu$. Note that $\mu$ is equal to the raw mean of the data only when the data are balanced, which is not the case here (see the `status` and `PARITY` tables).
+
+### Design matrix for `status`
+
+Status level 1 has no observations in this data set, so `status` has three observed levels (0, 2 and 3). Under the sum-to-zero constraint, a factor with $k$ levels needs $k - 1$ columns in $\mathbf{X}$. Then, the fixed effects of status are coded as:
+$$
+\mathbf{b}_1 =
+\begin{pmatrix}
+b_{1_0} \\
+b_{1_3}
+\end{pmatrix} \in \mathbb{R}^{n_{b_1} \times 1}
+$$
+In this case $n_{b_1} = 2$.
+
+The level $b_{1_2}$ corresponds to the fixed effect of cows with an observed pregnancy loss between day 32 and day 60 (status 2). This level is absorbed by the constraint, and I chose to absorb this level given the small number of observations in this category. Note that the constraint implies $\sum_{j \in \{0, 2, 3\}} b_{1_j} = 0$. That means that the point estimate of $b_{1_2}$ can be recovered as $\hat{b}_{1_2} = - \hat{b}_{1_0} - \hat{b}_{1_3}$. The choice of the absorbed level does not change the estimates: absorbing any other level gives the same $\hat{\mu}$ and the same level effects.
+
+The variance of $\hat{b}_{1_2}$ can also be recovered, because $\hat{b}_{1_2}$ is a linear combination of estimated parameters:
+$$
+\text{Var}(\hat{b}_{1_2}) = \text{Var}(\hat{b}_{1_0}) + \text{Var}(\hat{b}_{1_3}) + 2\,\text{Cov}(\hat{b}_{1_0}, \hat{b}_{1_3})
+$$
+Where the variances and the covariance are taken from the inverse of the MME coefficient matrix. Hence, the significance of $b_{1_2}$ can be tested without changing the constraint.
+
+The design matrix connecting $\mathbf{b}_1$ with the response variable is $\mathbf{X}_1$ and is represented below.
+$$
+\mathbf{X}_1 =
+\begin{pmatrix}
+x_{1,1} & x_{1,2} \\
+x_{2,1} & x_{2,2} \\
+\vdots & \vdots \\
+x_{N,1} & x_{N,2}
+\end{pmatrix} \in \mathbb{R}^{N \times n_{b_1}}
+$$
+The elements of the design matrix $\mathbf{X}_1$ are integers in $\{-1, 0, 1\}$ and are symbolized as $x_{i,j_1}$.
+
+The subscript $i$ points to the row number. Then $i \in \{1, \dots, N\}$.
+
+The subscript $j_1$ points to the column of $\mathbf{X}_1$. Then $j_1 \in \{1, 2\}$, where column 1 corresponds to $b_{1_0}$ and column 2 to $b_{1_3}$.
+
+Then, the value of $x_{i,j_1}$ depends on the status level of the phenotype in row $i$ and on the column $j_1$:
+
+$$
+x_{i,j_1=1} =
+\begin{cases}
+\phantom{-}1 & \text{if the phenotype in row } i \text{ has status level } 0,\\
+-1 & \text{if the phenotype in row } i \text{ has status level } 2,\\
+\phantom{-}0 & \text{if the phenotype in row } i \text{ has status level } 3.
+\end{cases}
+$$
+
+$$
+x_{i,j_1=2} =
+\begin{cases}
+\phantom{-}0 & \text{if the phenotype in row } i \text{ has status level } 0,\\
+-1 & \text{if the phenotype in row } i \text{ has status level } 2,\\
+\phantom{-}1 & \text{if the phenotype in row } i \text{ has status level } 3.
+\end{cases}
+$$
+
+### Creation of design matrix $\mathbf{X}_1$
+
+Each row of $\mathbf{X}_1$ follows the row order of `fdf`. The phenotype vector $\mathbf{y}$ (and the other design matrices) must use the same row order.
+```{r}
+N <- nrow(fdf)
+X1 <- matrix(data = 0, nrow = N, ncol = 2)
+
+# Column 1 (b_{1_0}): 1 if status 0, -1 if status 2, 0 if status 3.
+X1[fdf$status == '0', 1] <- 1
+X1[fdf$status == '2', 1] <- -1
+
+# Column 2 (b_{1_3}): 0 if status 0, -1 if status 2, 1 if status 3.
+X1[fdf$status == '3', 2] <- 1
+X1[fdf$status == '2', 2] <- -1
+
+dim(X1)
+head(X1)
+```
+
+Check: every status level maps to the expected row pattern, and the counts match the `status` table.
+```{r}
+stopifnot(sum(X1[, 1] == 1) == sum(fdf$status == 0))
+stopifnot(sum(X1[, 1] == -1) == sum(fdf$status == 2))
+stopifnot(sum(X1[, 1] == 0) == sum(fdf$status == 3))
+
+stopifnot(sum(X1[, 2] == 1) == sum(fdf$status == 3))
+stopifnot(sum(X1[, 2] == -1) == sum(fdf$status == 2))
+stopifnot(sum(X1[, 2] == 0) == sum(fdf$status == 0))
+```
+
+### Design matrix for `PARITY`
+
+`PARITY` has three observed levels (1, 2 and 3). Under the sum-to-zero constraint, a factor with $k$ levels needs $k - 1$ columns in $\mathbf{X}$. Then, the fixed effects of parity are coded as:
+$$
+\mathbf{b}_2 =
+\begin{pmatrix}
+b_{2_1} \\
+b_{2_2}
+\end{pmatrix} \in \mathbb{R}^{n_{b_2} \times 1}
+$$
+In this case $n_{b_2} = 2$.
+
+The level $b_{2_3}$ corresponds to the fixed effect of cows in parity 3. This level is absorbed by the constraint, and $b_{2_1}$ and $b_{2_2}$ are estimated directly. Note that the constraint implies $\sum_{j \in \{1, 2, 3\}} b_{2_j} = 0$. That means that the point estimate of $b_{2_3}$ can be recovered as $\hat{b}_{2_3} = - \hat{b}_{2_1} - \hat{b}_{2_2}$. As for status, the choice of the absorbed level does not change the estimates.
+
+The variance of $\hat{b}_{2_3}$ can also be recovered, because $\hat{b}_{2_3}$ is a linear combination of estimated parameters:
+$$
+\text{Var}(\hat{b}_{2_3}) = \text{Var}(\hat{b}_{2_1}) + \text{Var}(\hat{b}_{2_2}) + 2\,\text{Cov}(\hat{b}_{2_1}, \hat{b}_{2_2})
+$$
+Where the variances and the covariance are taken from the inverse of the MME coefficient matrix. Hence, the significance of $b_{2_3}$ can be tested without changing the constraint.
+
+The design matrix connecting $\mathbf{b}_2$ with the response variable is $\mathbf{X}_2$ and is represented below.
+$$
+\mathbf{X}_2 =
+\begin{pmatrix}
+x_{1,1} & x_{1,2} \\
+x_{2,1} & x_{2,2} \\
+\vdots & \vdots \\
+x_{N,1} & x_{N,2}
+\end{pmatrix} \in \mathbb{R}^{N \times n_{b_2}}
+$$
+The elements of the design matrix $\mathbf{X}_2$ are integers in $\{-1, 0, 1\}$ and are symbolized as $x_{i,j_2}$.
+
+The subscript $i$ points to the row number. Then $i \in \{1, \dots, N\}$.
+
+The subscript $j_2$ points to the column of $\mathbf{X}_2$. Then $j_2 \in \{1, 2\}$, where column 1 corresponds to $b_{2_1}$ and column 2 to $b_{2_2}$.
+
+Then, the value of $x_{i,j_2}$ depends on the parity level of the phenotype in row $i$ and on the column $j_2$:
+
+$$
+x_{i,j_2=1} =
+\begin{cases}
+\phantom{-}1 & \text{if the phenotype in row } i \text{ has parity level } 1,\\
+\phantom{-}0 & \text{if the phenotype in row } i \text{ has parity level } 2,\\
+-1 & \text{if the phenotype in row } i \text{ has parity level } 3.
+\end{cases}
+$$
+
+$$
+x_{i,j_2=2} =
+\begin{cases}
+\phantom{-}0 & \text{if the phenotype in row } i \text{ has parity level } 1,\\
+\phantom{-}1 & \text{if the phenotype in row } i \text{ has parity level } 2,\\
+-1 & \text{if the phenotype in row } i \text{ has parity level } 3.
+\end{cases}
+$$
+
+### Creation of design matrix $\mathbf{X}_2$
+
+Each row of $\mathbf{X}_2$ follows the row order of `fdf`, the same as $\mathbf{X}_1$.
+```{r}
+X2 <- matrix(data = 0, nrow = N, ncol = 2)
+
+# Column 1 (b_{2_1}): 1 if parity 1, 0 if parity 2, -1 if parity 3.
+X2[fdf$PARITY == '1', 1] <- 1
+X2[fdf$PARITY == '3', 1] <- -1
+
+# Column 2 (b_{2_2}): 0 if parity 1, 1 if parity 2, -1 if parity 3.
+X2[fdf$PARITY == '2', 2] <- 1
+X2[fdf$PARITY == '3', 2] <- -1
+
+dim(X2)
+head(X2)
+```
+
+Check: every parity level maps to the expected row pattern, and the counts match the `PARITY` table.
+```{r}
+stopifnot(sum(X2[, 1] == 1) == sum(fdf$PARITY == 1))
+stopifnot(sum(X2[, 1] == -1) == sum(fdf$PARITY == 3))
+stopifnot(sum(X2[, 1] == 0) == sum(fdf$PARITY == 2))
+
+stopifnot(sum(X2[, 2] == 1) == sum(fdf$PARITY == 2))
+stopifnot(sum(X2[, 2] == -1) == sum(fdf$PARITY == 3))
+stopifnot(sum(X2[, 2] == 0) == sum(fdf$PARITY == 1))
+```
+
+
+### Design matrix for the intercept $\mu$
+
+The intercept $\mu$ acts as the reference point from which the effects of the status and parity levels are expressed as deviations. Under the sum-to-zero constraint, $\mu$ is the unweighted mean of the level means (not the raw mean of the data, because the data are unbalanced).
+
+Every phenotype receives the effect $\mu$, regardless of its status or parity level. In terms of design matrix, this means that I only need a column of ones, $\mathbf{X}_{\mu} = \mathbf{1}_N$, to tag the effect $\mu$ in each row.
+
+### Creation of design matrix $\mathbf{X}_{\mu}$
+
+```{r}
+Xmu <- matrix(data = 1, nrow = N, ncol = 1)
+dim(Xmu)
+```
+
+### Combine design matrices in $\mathbf{X}$
+
+All design matrices are combined into a single design matrix $\mathbf{X}$, following the same order as the partition $\mathbf{X} = \begin{pmatrix} \mathbf{1}_N & \mathbf{X}_1 & \mathbf{X}_2 \end{pmatrix}$. Then, $\mathbf{X} \in \mathbb{R}^{N \times p}$ with $p = 1 + n_{b_1} + n_{b_2} = 1 + 2 + 2 = 5$.
+
+```{r}
+X <- cbind(Xmu, X1, X2)
+
+dim(X)
+head(X)
+tail(X)
+```
+
+### Vector of fixed effects
+
+Each column of $\mathbf{X}$ maps one element of $\mathbf{b}$, in the same order. Then, the vector of fixed effects is:
+$$
+\mathbf{b} =
+\begin{pmatrix}
+\mu \\ \mathbf{b}_1 \\ \mathbf{b}_2
+\end{pmatrix} =
+\begin{pmatrix}
+\mu \\ b_{1_0} \\ b_{1_3} \\ b_{2_1} \\ b_{2_2}
+\end{pmatrix} \in \mathbb{R}^{p \times 1}
+$$
+The absorbed levels are recovered after solving the system as $\hat{b}_{1_2} = - \hat{b}_{1_0} - \hat{b}_{1_3}$ and $\hat{b}_{2_3} = - \hat{b}_{2_1} - \hat{b}_{2_2}$.
+
+### Check that $\mathbf{X}^\top \mathbf{X}$ is non-singular
+
+With the sum-to-zero constraint, $\mathbf{X}$ should have full column rank ($\text{rank}(\mathbf{X}) = p$), which makes $\mathbf{X}^\top \mathbf{X}$ non-singular and invertible.
+```{r}
+qr(X)$rank
+stopifnot(qr(X)$rank == ncol(X))
+
+XtX <- t(X) %*% X
+XtX
+solve(XtX)
+```
+
+
+### Column names mapping to levels of fixed effects
+
+Each column of $\mathbf{X}$ maps one element of $\mathbf{b}$. To keep track of which fixed-effect level is encoded by each column, I name each column of $\mathbf{X}$ with the effect it maps:
+
+| Column of $\mathbf{X}$ | Name | Effect mapped |
+|:---:|:---|:---|
+| 1 | `mu` | $\mu$ |
+| 2 | `status0` | $b_{1_0}$ |
+| 3 | `status3` | $b_{1_3}$ |
+| 4 | `parity1` | $b_{2_1}$ |
+| 5 | `parity2` | $b_{2_2}$ |
+
+```{r}
+colnames(X) <- c('mu', 'status0', 'status3', 'parity1', 'parity2')
+head(X)
+```
+
+### Row names mapping to animal level
+
+We do not have repeated records. Hence, a given animal level is observed only one time. Therefore, I can simply name each row of $\mathbf{X}$ with the ID of its animal (`fdf$ID`, the pedigree ID), to track the connection between the response variable and the design matrix.
+```{r}
+rownames(X) <- fdf$ID
+head(X)
+```
+
+
+## Random effects
+
+$$
+\begin{pmatrix}
+\mathbf{a}_1 \\
+\mathbf{a}_2
+\end{pmatrix} = \mathbf{a} \in \mathbb{R}^{K \times 1}
+$$
+The column vector $\mathbf{a}$ has $K = n_{a_1} + n_{a_2}$ random additive genetic effects.
+
+The variable $n_{a_1}$ represents the number of animals with pedigree but without genotypes.
+
+The variable $n_{a_2}$ represents the number of animals with pedigree and with genotypes.
+
+The vector $\mathbf{a}$ has $K$ levels. Each level is an additive random animal effect. Note that an animal can belong to one of four sets. The three digits in the name of the set indicate, in this order, pedigree, phenotype and genotype (1 = yes, 0 = no):
+
+| Set | Pedigree | Phenotype | Genotype | Belongs to | Has a record in $\mathbf{y}$ |
+|:---:|:---:|:---:|:---:|:---:|:---:|
+| $A_{100}$ | Yes | No  | No  | $\mathbf{a}_1$ | No |
+| $A_{110}$ | Yes | Yes | No  | $\mathbf{a}_1$ | Yes ($\mathbf{y}_1$) |
+| $A_{101}$ | Yes | No  | Yes | $\mathbf{a}_2$ | No |
+| $A_{111}$ | Yes | Yes | Yes | $\mathbf{a}_2$ | Yes ($\mathbf{y}_2$) |
+
+Here, "genotyped" means genotyped and kept after the quality control of the genotypes (see Genotype data). An animal removed by the quality control is treated as non-genotyped.
+
+Animals in sets $A_{100}$ and $A_{101}$ have no phenotype, so their columns in $\mathbf{W}$ are all zeros. They are still in $\mathbf{a}$ because they connect the phenotyped animals through the relationship matrix.
+
+Note that I code all animals as having pedigree. This comes from an assumption: even if an animal does not have pedigree, I assume it is unrelated to the other animals, and it is added in the pedigree as an animal with unknown sire and dam.
+
+Then, the pedigree relationship matrix is the only matrix that allows the connection among all animals.
+
+Therefore, the construction of this matrix is fundamental.
+
+# Genotype data
+
+The genotypes are processed before the pedigree. The quality control (QC) can remove animals (low call rate), and an animal removed by QC is treated as non-genotyped. Then, the genotyped animals used to extend the pedigree and to define the sets of animals (see Random effects) must be the animals that survive QC.
+
+## Definition of matrix $\mathbf{Z}$
+
+The matrix $\mathbf{M}$ holds the raw SNP dosages.
+
+An element in $\mathbf{M}$ is symbolized as $m_{ij}$.
+
+
+Subscript $i$ points to row (animal). Then $i \in \{1, ..., K_g\}$. The variable $K_g$ denotes the number of genotyped animals.
+
+Subscript $j$ points to the marker or SNP. Then $j \in \{1, ..., J \}$. Where variable $J$ denotes the number of unique markers under analysis. I use $J$ (and not $m$) to avoid confusion with the dosage $m_{ij}$.
+
+A given column of the matrix $\mathbf{M}$ can be defined as $\mathbf{M}_{.j} = \mathbf{m}_j \in \mathbb{R}^{K_g\times 1}$. It can be seen as below:
+
+$$
+\mathbf{m}_j =
+\begin{pmatrix}
+m_{1j} \\ m_{2j} \\ \vdots \\ m_{K_gj}
+\end{pmatrix}
+$$
+Where $m_{ij} \in \{0, 1, 2\}$. These three values are the dosages of the alternative allele. If in animal $i$ marker $j$ there is no alternative allele, then $m_{ij} = 0$. If there is one alternative allele then $m_{ij} = 1$. If there are 2 alternative alleles then $m_{ij} = 2$.
+
+It is recommended to center the marker dosages, such that the mean of each centered column (each column of $\mathbf{Z}$) is zero.
+
+To do this, we need to subtract from each column its mean dosage.
+
+Let $p_j$ be the frequency of the alternative allele of marker $j$. Under Hardy-Weinberg equilibrium, the mean dosage is:
+
+$$
+\mathbb{E}\left[ m_{ij}\right] = 
+0 \times \mathbb{P}\left(m_{ij} = 0 \right) +
+1 \times \mathbb{P}\left(m_{ij} = 1 \right) +
+2 \times \mathbb{P}\left(m_{ij} = 2 \right) \\ \ 
+= 0 (1-p_j)^2 + 1\left[ 2\left(1-p_j \right)p_j\right] + 2 p_j^2 \\ \
+= 2p_j - 2p_j^2 + 2p_j^2 \\ \
+= 2p_j
+$$
+
+Then, a centered column of marker dosage is:
+$$
+\mathbf{z}_j = \mathbf{m}_j - 2p_j
+$$
+
+Then, we can do this for every marker and construct a new design matrix composed by centered marker dosages.
+
+$$
+\mathbf{Z} = 
+\begin{pmatrix}
+\mathbf{z}_1 & \mathbf{z}_2 & \dots & \mathbf{z}_J
+\end{pmatrix} \in \mathbb{R}^{K_g \times J}
+$$
+
+## Load matrix $\mathbf{M}$
+
+We will start the construction of $\mathbf{Z}$ by loading $\mathbf{M}$.
+
+### Read the genotype file
+
+Each line of the genotype file has the animal ID, two numeric fields, and the genotypes as one string of digits (one digit per SNP). `fread()` from `data.table` reads only the ID and the genotype string (columns 1 and 4), as text. The IDs are kept in `geno`.
+```{r}
+geno_txt <- data.table::fread(file = '../data/imputed_genotypes.txt', header = FALSE,
+                              select = c(1, 4), colClasses = 'character')
+geno <- data.frame(key = geno_txt$V1)
+nrow(geno)
+stopifnot(!any(duplicated(geno$key)))
+```
+
+### Recode the IDs of genotyped animals to pedigree IDs
+
+The IDs in the genotype file do not match the pedigree IDs. The file `Keys_to_ID.txt` maps each genotype ID (`Key`) to its pedigree ID (`ID`). Its first line is blank, so I skip it. Genotyped animals whose ID is not in the key cannot be recoded, so they keep their original ID.
+```{r}
+keys <- read.table(file = '../data/Keys_to_ID.txt', header = TRUE, skip = 1,
+                   colClasses = 'character') # Read IDs as text, not numbers.
+stopifnot(identical(names(keys), c('Key', 'ID')))
+stopifnot(!any(duplicated(keys$Key)))
+
+geno$animal <- keys$ID[match(geno$key, keys$Key)]
+sum(is.na(geno$animal)) # Genotyped animals that cannot be recoded.
+geno$animal[is.na(geno$animal)] <- geno$key[is.na(geno$animal)]
+stopifnot(!any(duplicated(geno$animal))) # One row per animal.
+head(geno)
+```
+
+### Create matrix $\mathbf{M}$
+
+`utf8ToInt()` converts each genotype string into character codes, and subtracting 48 (the code of `'0'`) gives the digits. Rows of $\mathbf{M}$ are the genotyped animals, named with their pedigree IDs (`geno$animal`), and columns are the SNPs, in the order of the file.
+```{r}
+m <- nchar(geno_txt$V4[1]) # Number of SNPs. vapply() stops if a line has a different length.
+M <- t(vapply(geno_txt$V4, function(x) utf8ToInt(x) - 48L, integer(m), USE.NAMES = FALSE))
+rownames(M) <- geno$animal
+rm(geno_txt)
+
+dim(M)
+M[1:5, 1:10]
+```
+
+### Frequency of genotype codes
+
+Frequency of each genotype code in $\mathbf{M}$. Note that codes 3, 4 and 5 also appear, not only 0, 1 and 2.
+```{r}
+code_count <- tabulate(M + 1L) # Counts of codes 0, 1, 2, ... (fast alternative to table()).
+names(code_count) <- seq_along(code_count) - 1L
+code_count
+round(100 * code_count / length(M), 2) # Percentage of all genotypes.
+```
+## Quality control over $\mathbf{M}$
+
+Codes 3, 4 and 5 are genotypes with one or both alleles unknown. They are all collapsed into code 6 (unknown). Codes 0, 1 and 2 are the known dosages.
+```{r}
+M[M >= 3L & M <= 5L] <- 6L
+code_count <- tabulate(M + 1L)
+names(code_count) <- seq_along(code_count) - 1L
+code_count
+```
+
+### Minor allele frequency (MAF)
+
+For each marker, the allele frequency $p_j$ is computed from the known genotypes only, and $\text{MAF}_j = \min(p_j, 1 - p_j)$. Markers with $\text{MAF}_j \le 0.05$ are removed, and so are markers without any known genotype (MAF not defined).
+```{r}
+n0 <- colSums(M == 0L); n1 <- colSums(M == 1L); n2 <- colSums(M == 2L)
+p <- (n1 + 2 * n2) / (2 * (n0 + n1 + n2))
+maf <- pmin(p, 1 - p)
+keep_snp <- !is.na(maf) & maf > 0.05
+sum(is.na(maf)) # Markers without known genotypes (all are 6).
+sum(!keep_snp)  # Markers removed.
+100*sum(!keep_snp)/ncol(M) # Percentage removed
+M <- M[, keep_snp]
+dim(M)
+```
+
+### Call rate per animal
+
+The call rate of an animal is the proportion of its markers with a known genotype (codes 0, 1 or 2). Animals with call rate $< 0.90$ are removed from $\mathbf{M}$ and from `geno`. Then, they are treated as non-genotyped in the rest of the analysis (pedigree and sets of animals).
+```{r}
+call_rate <- rowMeans(M != 6L)
+summary(call_rate)
+sum(call_rate < 0.90) # Animals removed.
+M <- M[call_rate >= 0.90, , drop = FALSE]
+geno <- geno[geno$animal %in% rownames(M), ] # Genotyped animals after QC.
+stopifnot(identical(geno$animal, rownames(M)))
+dim(M)
+```
+
+### Hardy-Weinberg equilibrium (HWE)
+
+For each marker, HWE is tested with the exact test (Wigginton et al., 2005) on the known genotypes of the remaining animals, using `HWExactStats()` from the `HardyWeinberg` package. One test is done per marker, so the threshold is Bonferroni-corrected: $\alpha = 0.05 / J$, where $J$ is the number of markers tested. Markers with $p$-value $\le \alpha$ are removed.
+```{r}
+n0 <- colSums(M == 0L); n1 <- colSums(M == 1L); n2 <- colSums(M == 2L)
+hwe_p <- HardyWeinberg::HWExactStats(cbind(AA = n2, AB = n1, BB = n0))
+alpha <- 0.05 / ncol(M)
+alpha
+min(hwe_p)
+sum(hwe_p <= alpha) # Markers removed.
+M <- M[, hwe_p > alpha]
+dim(M)
+```
+
+### Imputation of missing dosages
+
+With the surviving markers and animals, $p_j$ is recomputed from the known genotypes only. Then, each missing dosage (code 6) of marker $j$ is replaced by its expected value, $2p_j$.
+```{r}
+miss <- M == 6L
+sum(miss)                   # Missing dosages before imputation.
+100 * sum(miss) / length(M) # Percentage of missing dosages.
+
+p <- (colSums(M == 1L) + 2 * colSums(M == 2L)) / (2 * colSums(!miss))
+idx <- which(miss, arr.ind = TRUE)
+M[idx] <- 2 * p[idx[, 2]]
+rm(miss, idx)
+
+stopifnot(!any(M == 6))                                  # No missing dosage left.
+stopifnot(all.equal(unname(colMeans(M)), unname(2 * p))) # Column means are 2p_j.
+dim(M)
+```
+
+## Create matrix $\mathbf{Z}$
+
+Using the mean $2p_j$ per marker and the cleaned dosage matrix $\mathbf{M}$, I create the matrix $\mathbf{Z}$ by subtracting $2p_j$ from every element of column $j$.
+
+```{r}
+Z <- sweep(M, 2, 2 * p) # Subtract 2p_j from column j.
+stopifnot(all(abs(colMeans(Z)) < 1e-10)) # Every column of Z has mean 0.
+Z[1:3, 1:5]
+```
+
+# Pedigree
+
+## Read the pedigree file
+
+The pedigree file follows CDCB Format 1: 99 characters per line, no header and no delimiter. Missing parents are blank in the file and are read as `NA`.
+
+| Characters | Field | Description |
+|:---:|:---|:---|
+| 3--19 | `animal` | Animal ID (e.g., `HO840000000000000`) |
+| 20--36 | `sire` | Sire ID (`NA` if unknown) |
+| 37--53 | `dam` | Dam ID (`NA` if unknown) |
+| 71--78 | `birth` | Birth date `YYYYMMDD` (kept as text: some dates are coded with an `E` at the end) |
+
+The remaining characters (1--2, 54--70 and 79--99) are not needed and are not read.
+```{r}
+ped <- read_fwf(file = '../data/5gen_ped.txt',
+                col_positions = fwf_positions(start = c(3, 20, 37, 71),
+                                              end = c(19, 36, 53, 78),
+                                              col_names = c('animal', 'sire', 'dam', 'birth')),
+                col_types = cols(.default = col_character()),
+                na = '', trim_ws = TRUE, progress = FALSE)
+ped <- as.data.frame(ped)
+dim(ped)
+head(ped)
+```
+
+## Set missing parents to zero
+
+Missing parents (`NA`, or IDs that do not have 17 characters, e.g. dams coded only as `HO`) are set to `'0'`.
+```{r}
+stopifnot(sum(is.na(ped$animal)) == 0)
+stopifnot(length(unique(nchar(ped$animal))) == 1)
+
+# Set missing dams as zero:
+ped$dam[is.na(ped$dam)] <- '0'
+ped$dam[nchar(ped$dam) != 17] <- '0'
+# Set missing sires as zero:
+ped$sire[is.na(ped$sire)] <- '0'
+ped$sire[nchar(ped$sire) != 17] <- '0'
+
+```
+
+
+## Check that all sires are listed as animals
+
+Every known sire must also appear in the `animal` column. Sires that do not appear are listed in `miss_sires`.
+```{r}
+sires <- unique(ped$sire[ped$sire != '0'])
+miss_sires <- sires[!sires %in% ped$animal]
+length(sires)
+length(miss_sires)
+```
+
+## Check that all dams are listed as animals
+
+Every known dam must also appear in the `animal` column. Dams that do not appear are listed in `miss_dams`.
+```{r}
+dams <- unique(ped$dam[ped$dam != '0'])
+miss_dams <- dams[!dams %in% ped$animal]
+length(dams)
+length(miss_dams)
+```
+
+## Add missing parents as founders
+
+An animal cannot be both a sire and a dam. Then, the parents that are not listed as animals are added as founders (unknown sire and dam, coded as `'0'`). The founders are placed at the top of the pedigree, so they come before their offspring. The function `add_founders()` does this, and it also works when there is no animal to add. It is used again below for the genotyped and the phenotyped animals.
+```{r}
+stopifnot(length(intersect(sires, dams)) == 0)
+
+add_founders <- function(ped, ids) {
+  n <- length(ids)
+  founders <- data.frame(animal = ids, sire = rep('0', n), dam = rep('0', n), birth = rep('0', n))
+  rbind(founders, ped)
+}
+
+ped <- add_founders(ped, c(miss_sires, miss_dams))
+
+# Checks: every known parent is now an animal, and no animal is repeated.
+stopifnot(all(sires %in% ped$animal))
+stopifnot(all(dams %in% ped$animal))
+stopifnot(!any(duplicated(ped$animal)))
+
+length(c(miss_sires, miss_dams)) # Parents added as founders.
+dim(ped)
+```
+
+## Add genotyped animals not in pedigree
+
+Genotyped animals (after QC, with pedigree IDs; see Genotype data) that are not listed as animals are added as founders (unknown sire and dam, coded as `'0'`) at the top of the pedigree.
+```{r}
+miss_geno <- geno$animal[!geno$animal %in% ped$animal]
+length(miss_geno) # Genotyped animals not in pedigree.
+ped <- add_founders(ped, miss_geno)
+```
+
+## Add phenotyped animals not in pedigree
+
+The ID of a phenotyped cow (`fdf$ID`) is already the pedigree ID (`'HO'` + `EID`; see Read phenotype data). Phenotyped cows that are not listed as animals are added as founders, following the assumption in Random effects.
+```{r}
+miss_pheno <- fdf$ID[!fdf$ID %in% ped$animal]
+length(miss_pheno) # Phenotyped cows not in pedigree.
+ped <- add_founders(ped, miss_pheno)
+```
+
+## Final checks
+
+The pedigree must now include every animal of the four sets in the Random effects table.
+```{r}
+stopifnot(all(geno$animal %in% ped$animal)) # All genotyped animals.
+stopifnot(all(fdf$ID %in% ped$animal)) # All phenotyped animals.
+stopifnot(all(setdiff(c(ped$sire, ped$dam), '0') %in% ped$animal)) # All parents.
+stopifnot(!any(duplicated(ped$animal)))     # No animal repeated.
+dim(ped)
+
+# Number of animals in each set of the Random effects table.
+genotyped <- ifelse(ped$animal %in% geno$animal, 'Yes', 'No')
+phenotyped <- ifelse(ped$animal %in% fdf$ID, 'Yes', 'No')
+table(Genotype = genotyped, Phenotype = phenotyped)
+```
+
+# Numerator relationship matrix $\mathbf{A}$
+
+The matrix $\mathbf{A}$ contains the additive genetic relationships between all $K$ animals in the pedigree. I build it with the tabular method (Henderson, 1976; Mrode, 2014, Chapter 2). With the animals sorted so that parents come before their offspring, animal $i$ with sire $s$ and dam $d$ is processed row by row, for every animal $j < i$:
+
+| Parents of $i$ | Off-diagonal ($j < i$) | Diagonal |
+|:---|:---|:---|
+| Both known | $a_{ij} = a_{ji} = 0.5\,(a_{js} + a_{jd})$ | $a_{ii} = 1 + 0.5\,a_{sd}$ |
+| Only one known ($p$) | $a_{ij} = a_{ji} = 0.5\,a_{jp}$ | $a_{ii} = 1$ |
+| Both unknown | $a_{ij} = a_{ji} = 0$ | $a_{ii} = 1$ |
+
+The inbreeding coefficient of animal $i$ is $F_i = 0.5\,a_{sd}$, so $a_{ii} = 1 + F_i$.
+
+## Sort the pedigree: parents before offspring
+
+The tabular method needs every parent to appear before its offspring. I give each animal a generation number: founders (both parents unknown) are generation 0, and any other animal is 1 + the largest generation of its known parents. Sorting by generation puts every parent before its offspring. If, in one pass, no new animal can get a generation, the pedigree has a loop (an animal is its own ancestor), and the code stops.
+```{r}
+K <- nrow(ped)
+s_row <- match(ped$sire, ped$animal) # Row of the sire (NA if unknown).
+d_row <- match(ped$dam, ped$animal)  # Row of the dam (NA if unknown).
+sum(s_row > seq_len(K) | d_row > seq_len(K), na.rm = TRUE) # Animals listed before a parent.
+
+gen <- rep(NA_integer_, K)
+gen[is.na(s_row) & is.na(d_row)] <- 0L # Founders.
+while (anyNA(gen)) {
+  gen_s <- ifelse(is.na(s_row), -1L, gen[s_row]) # -1 if parent unknown.
+  gen_d <- ifelse(is.na(d_row), -1L, gen[d_row])
+  ready <- is.na(gen) & !is.na(gen_s) & !is.na(gen_d)
+  if (!any(ready)) stop('Pedigree loop: an animal is its own ancestor.')
+  gen[ready] <- pmax(gen_s[ready], gen_d[ready]) + 1L
+}
+table(gen)
+
+ped <- ped[order(gen), ]
+rownames(ped) <- NULL
+```
+
+## Recode animals as integers
+
+Each animal is coded by its row in the sorted pedigree (`id`), and its parents by their rows (`s` and `d`, 0 if unknown). After sorting, every parent must have a smaller code than its offspring.
+```{r}
+ped$id <- seq_len(K)
+ped$s <- match(ped$sire, ped$animal, nomatch = 0L)
+ped$d <- match(ped$dam, ped$animal, nomatch = 0L)
+stopifnot(all(ped$s < ped$id), all(ped$d < ped$id))
+head(ped)
+```
+
+## Function for the tabular method
+
+`make_A()` takes the integer codes of the sires (`s`) and dams (`d`) of a sorted pedigree and returns $\mathbf{A}$, following the rules in the table above. Row $i$ is computed at once for all $j < i$.
+```{r}
+make_A <- function(s, d) {
+  n <- length(s)
+  A <- matrix(data = 0, nrow = n, ncol = n)
+  for (i in seq_len(n)) {
+    if (i > 1) {
+      j <- seq_len(i - 1)
+      a_s <- if (s[i] > 0) A[j, s[i]] else 0 # 0 if sire unknown.
+      a_d <- if (d[i] > 0) A[j, d[i]] else 0 # 0 if dam unknown.
+      A[j, i] <- 0.5 * (a_s + a_d)
+      A[i, j] <- A[j, i]
+    }
+    A[i, i] <- if (s[i] > 0 && d[i] > 0) 1 + 0.5 * A[s[i], d[i]] else 1
+  }
+  A
+}
+```
+
+## Check the function with a small pedigree
+
+Before using `make_A()` on the data, I check it on the 6-animal pedigree of Mrode (2014, Chapter 2), whose $\mathbf{A}$ is known (exact values; the book rounds them to 3 decimals).
+
+| Animal | Sire | Dam |
+|:---:|:---:|:---:|
+| 1 | 0 | 0 |
+| 2 | 0 | 0 |
+| 3 | 1 | 2 |
+| 4 | 1 | 0 |
+| 5 | 4 | 3 |
+| 6 | 5 | 2 |
+
+```{r}
+A_mrode <- matrix(data = c(1,    0,     0.5,    0.5,    0.5,    0.25,
+                           0,    1,     0.5,    0,      0.25,   0.625,
+                           0.5,  0.5,   1,      0.25,   0.625,  0.5625,
+                           0.5,  0,     0.25,   1,      0.625,  0.3125,
+                           0.5,  0.25,  0.625,  0.625,  1.125,  0.6875,
+                           0.25, 0.625, 0.5625, 0.3125, 0.6875, 1.125),
+                  nrow = 6, byrow = TRUE)
+stopifnot(all.equal(make_A(s = c(0, 0, 1, 1, 4, 5), d = c(0, 0, 2, 0, 3, 2)), A_mrode))
+```
+
+## Create $\mathbf{A}$
+
+Rows and columns of $\mathbf{A}$ are named with the animal IDs, in the order of the sorted pedigree. Note that $\mathbf{A}$ is a dense $K \times K$ matrix, so its memory grows with $K^2$ (here $K$ = `r K` animals). For much larger pedigrees, $\mathbf{A}^{-1}$ is built directly instead, because it is sparse.
+```{r}
+A <- make_A(s = ped$s, d = ped$d)
+dimnames(A) <- list(ped$animal, ped$animal)
+dim(A)
+format(object.size(A), units = 'MB')
+A[1:5, 1:5]
+```
+
+## Check the $\mathbf{A}$ matrix
+
+1. $\mathbf{A}$ is symmetric.
+2. Founders have $a_{ii} = 1$ and are unrelated to each other, so their block of $\mathbf{A}$ is an identity matrix.
+3. For every animal, $a_{ii} = 1 + F_i$ with $F_i = 0.5\,a_{sd}$ ($F_i = 0$ if a parent is unknown).
+4. $\mathbf{A}$ is identical to the one from an independent implementation, `makeA()` from the `nadiv` package.
+```{r}
+stopifnot(isSymmetric(A))
+
+founder <- ped$s == 0 & ped$d == 0
+stopifnot(all(A[founder, founder] == diag(sum(founder))))
+
+both <- ped$s > 0 & ped$d > 0
+Fi <- rep(0, K) # Inbreeding coefficients.
+Fi[both] <- 0.5 * A[cbind(ped$s[both], ped$d[both])]
+stopifnot(all.equal(unname(diag(A)), 1 + Fi))
+
+ped_nadiv <- data.frame(ID = ped$animal,
+                        Dam = ifelse(ped$dam == '0', NA, ped$dam),
+                        Sire = ifelse(ped$sire == '0', NA, ped$sire))
+A_nadiv <- as.matrix(nadiv::makeA(ped_nadiv))
+stopifnot(all.equal(A, A_nadiv[ped$animal, ped$animal]))
+```
+
+Inbreeding in the pedigree.
+```{r}
+sum(Fi > 0) # Inbred animals.
+summary(Fi)
+```
+
+# Reorder and partition $\mathbf{A}$ by sets of animals
+
+## Partition of $\mathbf{A}$
+
+The vector of additive genetic effects is partitioned as $\mathbf{a} = \begin{pmatrix} \mathbf{a}_1 \\ \mathbf{a}_2 \end{pmatrix}$, where $\mathbf{a}_1$ contains the $n_{a_1}$ non-genotyped animals and $\mathbf{a}_2$ the $n_{a_2}$ genotyped animals. Then, $\mathbf{A}$ is reordered so that the non-genotyped animals come first and the genotyped animals last, and it is partitioned in the same way:
+$$
+\mathbf{A} =
+\begin{pmatrix}
+\mathbf{A}_{11} & \mathbf{A}_{12} \\
+\mathbf{A}_{21} & \mathbf{A}_{22}
+\end{pmatrix}
+$$
+Where $\mathbf{A}_{11} \in \mathbb{R}^{n_{a_1} \times n_{a_1}}$ contains the pedigree relationships among non-genotyped animals, $\mathbf{A}_{22} \in \mathbb{R}^{n_{a_2} \times n_{a_2}}$ among genotyped animals, and $\mathbf{A}_{12} = \mathbf{A}_{21}^\top$ between both groups.
+
+Essentially, we are working with two groups of animals:
+
+1. Animals with pedigree and without genotypes (in $\mathbf{A}_{11}$).
+
+2. Animals with pedigree and with genotypes (in $\mathbf{A}_{22}$). Their genomic relationships ($\mathbf{G}$) are defined in Genomic information.
+
+Within each group, there are animals with and without phenotypes. Then, every animal belongs to one of the four sets defined in Random effects: $A_{100}$ and $A_{110}$ (in $\mathbf{a}_1$), and $A_{101}$ and $A_{111}$ (in $\mathbf{a}_2$). Genotyped animals are those kept after QC (`geno`).
+
+Number of animals in each set:
+```{r}
+is_geno <- ped$animal %in% geno$animal
+is_pheno <- ped$animal %in% fdf$ID
+animal_set <- ifelse(is_geno, ifelse(is_pheno, 'A111', 'A101'), ifelse(is_pheno, 'A110', 'A100'))
+table(factor(animal_set, levels = c('A100', 'A110', 'A101', 'A111')))
+```
+
+The numerator relationship matrix is the only matrix that includes all the animals, and each row (and column) of $\mathbf{A}$ corresponds to one animal. Then, to have a consistent alignment between $\mathbf{A}$, $\mathbf{G}$ and $\mathbf{y}$, the rows and columns of $\mathbf{A}$ are reordered by set, in this order: $A_{100}$, $A_{110}$, $A_{101}$, $A_{111}$. With this order, the non-genotyped animals ($\mathbf{a}_1$) come first and the genotyped animals ($\mathbf{a}_2$) last, and within each group the phenotyped animals come last: $\mathbf{y}_1$ holds the phenotypes of set $A_{110}$, and $\mathbf{y}_2$ those of set $A_{111}$.
+
+Each block of $\mathbf{A}$ is then partitioned into four sub-blocks:
+$$
+\mathbf{A} =
+\begin{pmatrix}
+\mathbf{A}_{11} & \mathbf{A}_{12} \\
+\mathbf{A}_{21} & \mathbf{A}_{22}
+\end{pmatrix}
+=
+\left(
+\begin{array}{cc|cc}
+\mathbf{A}_{11_{00}} & \mathbf{A}_{11_{01}} & \mathbf{A}_{12_{00}} & \mathbf{A}_{12_{01}} \\
+\mathbf{A}_{11_{10}} & \mathbf{A}_{11_{11}} & \mathbf{A}_{12_{10}} & \mathbf{A}_{12_{11}} \\
+\hline
+\mathbf{A}_{21_{00}} & \mathbf{A}_{21_{01}} & \mathbf{A}_{22_{00}} & \mathbf{A}_{22_{01}} \\
+\mathbf{A}_{21_{10}} & \mathbf{A}_{21_{11}} & \mathbf{A}_{22_{10}} & \mathbf{A}_{22_{11}}
+\end{array}
+\right)
+$$
+The four rows (and the four columns) of sub-blocks correspond to the sets $A_{100}$, $A_{110}$, $A_{101}$ and $A_{111}$, in this order.
+
+**Notation.** In $\mathbf{A}_{kl_{rc}}$:
+
+- $k$ and $l$ give the block of $\mathbf{A}$: $k$ for the rows and $l$ for the columns (1 = without genotype, 2 = with genotype).
+
+- $r$ and $c$ give the sub-block within that block: $r$ for the rows and $c$ for the columns (0 = without phenotype, 1 = with phenotype).
+
+For example, $\mathbf{A}_{12_{01}}$ has rows = non-genotyped animals without phenotype (set $A_{100}$), and columns = genotyped animals with phenotype (set $A_{111}$). Below, "between set $X$ and set $Y$" always means rows from $X$ and columns from $Y$.
+
+**Block $\mathbf{A}_{11}$** (non-genotyped animals):
+$$
+\mathbf{A}_{11} =
+\begin{pmatrix}
+\mathbf{A}_{11_{00}} & \mathbf{A}_{11_{01}} \\
+\mathbf{A}_{11_{10}} & \mathbf{A}_{11_{11}}
+\end{pmatrix}
+$$
+Where:
+
+- $\mathbf{A}_{11_{00}}$ holds the pedigree relationships among animals in set $A_{100}$.
+
+- $\mathbf{A}_{11_{11}}$ holds the pedigree relationships among animals in set $A_{110}$.
+
+- $\mathbf{A}_{11_{01}}$ holds the pedigree relationships between set $A_{100}$ and set $A_{110}$.
+
+- $\mathbf{A}_{11_{10}}$ holds the pedigree relationships between set $A_{110}$ and set $A_{100}$.
+
+**Block $\mathbf{A}_{22}$** (genotyped animals):
+$$
+\mathbf{A}_{22} =
+\begin{pmatrix}
+\mathbf{A}_{22_{00}} & \mathbf{A}_{22_{01}} \\
+\mathbf{A}_{22_{10}} & \mathbf{A}_{22_{11}}
+\end{pmatrix}
+$$
+Where:
+
+- $\mathbf{A}_{22_{00}}$ holds the pedigree relationships among animals in set $A_{101}$.
+
+- $\mathbf{A}_{22_{11}}$ holds the pedigree relationships among animals in set $A_{111}$.
+
+- $\mathbf{A}_{22_{01}}$ holds the pedigree relationships between set $A_{101}$ and set $A_{111}$.
+
+- $\mathbf{A}_{22_{10}}$ holds the pedigree relationships between set $A_{111}$ and set $A_{101}$.
+
+**Block $\mathbf{A}_{12}$** (rows: non-genotyped; columns: genotyped):
+$$
+\mathbf{A}_{12} =
+\begin{pmatrix}
+\mathbf{A}_{12_{00}} & \mathbf{A}_{12_{01}} \\
+\mathbf{A}_{12_{10}} & \mathbf{A}_{12_{11}}
+\end{pmatrix}
+$$
+Where:
+
+- $\mathbf{A}_{12_{00}}$ holds the pedigree relationships between set $A_{100}$ and set $A_{101}$.
+
+- $\mathbf{A}_{12_{01}}$ holds the pedigree relationships between set $A_{100}$ and set $A_{111}$.
+
+- $\mathbf{A}_{12_{10}}$ holds the pedigree relationships between set $A_{110}$ and set $A_{101}$.
+
+- $\mathbf{A}_{12_{11}}$ holds the pedigree relationships between set $A_{110}$ and set $A_{111}$.
+
+**Block $\mathbf{A}_{21}$** (rows: genotyped; columns: non-genotyped):
+$$
+\mathbf{A}_{21} =
+\begin{pmatrix}
+\mathbf{A}_{21_{00}} & \mathbf{A}_{21_{01}} \\
+\mathbf{A}_{21_{10}} & \mathbf{A}_{21_{11}}
+\end{pmatrix}
+$$
+Where:
+
+- $\mathbf{A}_{21_{00}}$ holds the pedigree relationships between set $A_{101}$ and set $A_{100}$.
+
+- $\mathbf{A}_{21_{01}}$ holds the pedigree relationships between set $A_{101}$ and set $A_{110}$.
+
+- $\mathbf{A}_{21_{10}}$ holds the pedigree relationships between set $A_{111}$ and set $A_{100}$.
+
+- $\mathbf{A}_{21_{11}}$ holds the pedigree relationships between set $A_{111}$ and set $A_{110}$.
+
+**Symmetry.** Since $\mathbf{A}$ is symmetric, only ten of the sixteen sub-blocks are needed; the other six are transposes:
+$$
+\mathbf{A}_{11_{10}} = \mathbf{A}_{11_{01}}^\top, \qquad
+\mathbf{A}_{22_{10}} = \mathbf{A}_{22_{01}}^\top
+$$
+$$
+\mathbf{A}_{21} = \mathbf{A}_{12}^\top =
+\begin{pmatrix}
+\mathbf{A}_{12_{00}}^\top & \mathbf{A}_{12_{10}}^\top \\
+\mathbf{A}_{12_{01}}^\top & \mathbf{A}_{12_{11}}^\top
+\end{pmatrix}
+\quad \Rightarrow \quad
+\mathbf{A}_{21_{00}} = \mathbf{A}_{12_{00}}^\top, \quad
+\mathbf{A}_{21_{01}} = \mathbf{A}_{12_{10}}^\top, \quad
+\mathbf{A}_{21_{10}} = \mathbf{A}_{12_{01}}^\top, \quad
+\mathbf{A}_{21_{11}} = \mathbf{A}_{12_{11}}^\top
+$$
+Note that transposing $\mathbf{A}_{12}$ swaps its two off-diagonal sub-blocks: $\mathbf{A}_{21_{01}}$ is the transpose of $\mathbf{A}_{12_{10}}$, and $\mathbf{A}_{21_{10}}$ is the transpose of $\mathbf{A}_{12_{01}}$.
+
+**Empty sets.** If a set has no animals, its sub-blocks have zero rows or columns and simply drop out. In this data set, $A_{101}$ is empty (all genotyped animals have a phenotype; see the counts above), so $\mathbf{A}_{22} = \mathbf{A}_{22_{11}}$, $\mathbf{A}_{12} = \begin{pmatrix} \mathbf{A}_{12_{01}} \\ \mathbf{A}_{12_{11}} \end{pmatrix}$, and $\mathbf{A}_{21} = \begin{pmatrix} \mathbf{A}_{21_{10}} & \mathbf{A}_{21_{11}} \end{pmatrix}$.
+
+## Create the 4 sets of animals
+
+Each set is a vector of animal IDs, built from `animal_set` (see the number of animals in each set above). Non-genotyped animals keep the order of the sorted pedigree. Genotyped animals keep the order of the genotype file (`geno$animal`, after QC), which is also the row order of $\mathbf{M}$ and $\mathbf{Z}$.
+
+**$A_{100}$**: pedigree, no phenotype, no genotype.
+```{r}
+A100 <- ped$animal[animal_set == 'A100']
+length(A100)
+```
+
+**$A_{110}$**: pedigree, phenotype, no genotype.
+```{r}
+A110 <- ped$animal[animal_set == 'A110']
+length(A110)
+```
+
+**$A_{101}$**: pedigree, no phenotype, genotype.
+```{r}
+A101 <- geno$animal[!geno$animal %in% fdf$ID]
+length(A101)
+```
+
+**$A_{111}$**: pedigree, phenotype, genotype.
+```{r}
+A111 <- geno$animal[geno$animal %in% fdf$ID]
+length(A111)
+```
+
+Check: every animal of the pedigree is in exactly one set.
+```{r}
+all_sets <- c(A100, A110, A101, A111)
+stopifnot(length(all_sets) == nrow(ped), setequal(all_sets, ped$animal), !any(duplicated(all_sets)))
+```
+
+**Define the order of animal levels in $\mathbf{a}_1$**: first $A_{100}$, then $A_{110}$.
+```{r}
+a1_ids <- c(A100, A110)
+length(a1_ids) # n_a1
+```
+
+**Define the order of animal levels in $\mathbf{a}_2$**: first $A_{101}$, then $A_{111}$.
+```{r}
+a2_ids <- c(A101, A111)
+length(a2_ids) # n_a2
+```
+
+## Create $4^2$ sub-sub-numerator relationship matrices
+
+Each sub-block takes the rows of its row set and the columns of its column set from $\mathbf{A}$, selected by animal ID. `drop = FALSE` keeps a matrix even when a set is empty (a sub-block with zero rows or columns).
+```{r}
+# A11: non-genotyped x non-genotyped.
+A11_00 <- A[A100, A100, drop = FALSE]
+A11_01 <- A[A100, A110, drop = FALSE]
+A11_10 <- A[A110, A100, drop = FALSE]
+A11_11 <- A[A110, A110, drop = FALSE]
+# A12: non-genotyped (rows) x genotyped (columns).
+A12_00 <- A[A100, A101, drop = FALSE]
+A12_01 <- A[A100, A111, drop = FALSE]
+A12_10 <- A[A110, A101, drop = FALSE]
+A12_11 <- A[A110, A111, drop = FALSE]
+# A21: genotyped (rows) x non-genotyped (columns).
+A21_00 <- A[A101, A100, drop = FALSE]
+A21_01 <- A[A101, A110, drop = FALSE]
+A21_10 <- A[A111, A100, drop = FALSE]
+A21_11 <- A[A111, A110, drop = FALSE]
+# A22: genotyped x genotyped.
+A22_00 <- A[A101, A101, drop = FALSE]
+A22_01 <- A[A101, A111, drop = FALSE]
+A22_10 <- A[A111, A101, drop = FALSE]
+A22_11 <- A[A111, A111, drop = FALSE]
+```
+
+Check the symmetry relations (including the swap of the off-diagonal sub-blocks of $\mathbf{A}_{12}$).
+```{r}
+stopifnot(identical(A11_10, t(A11_01)), identical(A22_10, t(A22_01)))
+stopifnot(identical(A21_00, t(A12_00)), identical(A21_01, t(A12_10)),
+          identical(A21_10, t(A12_01)), identical(A21_11, t(A12_11)))
+```
+
+## Create $4^1$ sub-numerator relationship matrices
+
+Each block is built by binding its four sub-blocks: `cbind()` joins sub-blocks side by side (same rows), and `rbind()` stacks the results (same columns).
+```{r}
+A11 <- rbind(cbind(A11_00, A11_01), cbind(A11_10, A11_11))
+A12 <- rbind(cbind(A12_00, A12_01), cbind(A12_10, A12_11))
+A21 <- rbind(cbind(A21_00, A21_01), cbind(A21_10, A21_11))
+A22 <- rbind(cbind(A22_00, A22_01), cbind(A22_10, A22_11))
+dim(A11); dim(A12); dim(A21); dim(A22)
+
+# Check: each block equals A with rows and columns in the order of a1 and a2.
+stopifnot(identical(A11, A[a1_ids, a1_ids]), identical(A12, A[a1_ids, a2_ids]),
+          identical(A21, A[a2_ids, a1_ids]), identical(A22, A[a2_ids, a2_ids]))
+```
+
+## Combine the $4$ sub-matrices into a reordered numerator relationship matrix
+
+$\mathbf{A}_{\text{ord}} = \begin{pmatrix} \mathbf{A}_{11} & \mathbf{A}_{12} \\ \mathbf{A}_{21} & \mathbf{A}_{22} \end{pmatrix}$, with the animals in the order $A_{100}$, $A_{110}$, $A_{101}$, $A_{111}$.
+```{r}
+A_ord <- rbind(cbind(A11, A12), cbind(A21, A22))
+dim(A_ord)
+
+# Checks: same animals as A, reordered, and the same relationships.
+stopifnot(identical(rownames(A_ord), c(a1_ids, a2_ids)), identical(colnames(A_ord), c(a1_ids, a2_ids)))
+stopifnot(identical(A_ord, A[c(a1_ids, a2_ids), c(a1_ids, a2_ids)]))
+stopifnot(isSymmetric(A_ord))
+```
+
+# Align data with the ordered $\mathbf{A}$
+
+## Align $\mathbf{y}$ according to ordered $\mathbf{A}$
+
+The phenotyped animals are the sets $A_{110}$ (giving $\mathbf{y}_1$) and $A_{111}$ (giving $\mathbf{y}_2$). Then, $\mathbf{y} = \begin{pmatrix} \mathbf{y}_1 \\ \mathbf{y}_2 \end{pmatrix}$ follows the order of these animals in $\mathbf{A}_{\text{ord}}$: first $A_{110}$, then $A_{111}$. Each phenotype (`delta`) is taken from `fdf` by matching the animal ID, and $\mathbf{y}$ is named with the animal IDs.
+```{r}
+y_ids <- c(A110, A111) # Phenotyped animals, in the order of A_ord.
+y <- fdf$delta[match(y_ids, fdf$ID)]
+names(y) <- y_ids
+y1 <- y[A110]
+y2 <- y[A111]
+length(y1); length(y2)
+
+# Checks: every phenotype is used once, and each value belongs to its animal.
+stopifnot(length(y) == nrow(fdf), setequal(y_ids, fdf$ID), !anyNA(y))
+stopifnot(all(y == fdf$delta[match(names(y), fdf$ID)]))
+stopifnot(identical(y_ids, rownames(A_ord)[rownames(A_ord) %in% fdf$ID])) # Same order as A_ord.
+head(y)
+```
+
+## Align $\mathbf{X}$ according to ordered $\mathbf{A}$
+
+The rows of $\mathbf{X}$ follow the rows of `fdf`, and they are named with the animal ID (see Fixed effects). Then, the rows of $\mathbf{X}$ are reordered so that row $i$ of $\mathbf{X}_{\text{ord}}$ and element $i$ of $\mathbf{y}$ belong to the same animal.
+```{r}
+stopifnot(identical(rownames(X), fdf$ID)) # X rows follow fdf rows.
+X_ord <- X[y_ids, ]
+dim(X_ord)
+
+# Checks: X_ord and y refer to the same animals in the same order, and each row
+# of X_ord has the status and parity coding of its animal.
+stopifnot(identical(rownames(X_ord), names(y)))
+f <- fdf[match(y_ids, fdf$ID), ]
+stopifnot(all(X_ord[, 'mu'] == 1),
+          all(X_ord[, 'status0'] == (f$status == '0') - (f$status == '2')),
+          all(X_ord[, 'status3'] == (f$status == '3') - (f$status == '2')),
+          all(X_ord[, 'parity1'] == (f$PARITY == '1') - (f$PARITY == '3')),
+          all(X_ord[, 'parity2'] == (f$PARITY == '2') - (f$PARITY == '3')))
+head(X_ord)
+```
+
+## Align $\mathbf{Z}$ according to ordered $\mathbf{A}$
+
+The rows of $\mathbf{Z}$ follow the genotype file (`geno$animal`). They are reordered as $\mathbf{a}_2$ (first $A_{101}$, then $A_{111}$), so that the rows of $\mathbf{Z}$ (and later of $\mathbf{G}$) follow the order of the genotyped animals in $\mathbf{A}_{\text{ord}}$. In this data set $A_{101}$ is empty, so the order does not change, but the step keeps the code correct in general.
+```{r}
+Z <- Z[a2_ids, , drop = FALSE]
+dim(Z)
+stopifnot(identical(rownames(Z), rownames(A22)))
+stopifnot(identical(rownames(Z), tail(rownames(A_ord), length(a2_ids))))
+```
+
+# Genomic information
+
+## Use of pedigree to propagate genomic information
+
+The pedigree relationship matrix is used as a bridge to propagate information from genotyped animals to non-genotyped animals.
+
+The fundamental expression is below:
+$$
+\mathbb{E}[\mathbf{a}_1 | \mathbf{a}_2] = 
+\mathbb{E}[\mathbf{a}_1] + 
+\Sigma_{\mathbf{a}_1\mathbf{a}_2}
+\Sigma_{\mathbf{a}_2\mathbf{a}_2}^{-1}
+\left(\mathbf{a}_2 - \mathbb{E}[\mathbf{a}_2]\right)
+$$
+
+Unconditioned on the data:
+$$
+\mathbb{E}[\mathbf{a}_1] = \mathbf{0} \in \mathbb{R}^{n_{a_1} \times 1} \\ \
+\mathbb{E}[\mathbf{a}_2] = \mathbf{0} \in \mathbb{R}^{n_{a_2} \times 1}
+$$
+
+Then:
+$$
+\mathbb{E}[\mathbf{a}_1 | \mathbf{a}_2] = 
+\Sigma_{\mathbf{a}_1\mathbf{a}_2}
+\Sigma_{\mathbf{a}_2\mathbf{a}_2}^{-1}
+\mathbf{a}_2
+$$
+Where:
+$$
+\Sigma_{\mathbf{a}_1\mathbf{a}_2} = 
+\text{Cov}\left(\mathbf{a}_1, \mathbf{a}_2^\top \right) = 
+\mathbf{A}_{12} \sigma^2_a \\ \ \\ \
+\Sigma_{\mathbf{a}_2\mathbf{a}_2} = 
+\text{Cov}\left(\mathbf{a}_2, \mathbf{a}_2^\top \right) = 
+\mathbf{A}_{22} \sigma^2_a
+$$
+
+These are the pedigree (co)variances: the link between $\mathbf{a}_1$ and $\mathbf{a}_2$ is given by the pedigree. The genomic information enters through $\text{Var}\left[\mathbf{a}_2\right] = \mathbf{G}\sigma^2_a$ (see Variance of $\mathbf{a}$).
+
+The vector of additive random effects $\mathbf{a}_2$ can be derived from the genotype information ($\mathbf{Z}$, see Genotype data) as follows.
+
+$$
+\mathbf{a}_2 = \mathbf{Zg}
+$$
+Where:
+$$
+\mathbf{Z} \in \mathbb{R}^{K_g \times J}\\ \
+\mathbf{g}  \in \mathbb{R}^{J \times 1}
+$$
+The variable $K_g$ is the number of genotyped animals (after QC; see Genotype data).
+
+In this dataset, all genotyped animals have phenotypes (set $A_{101}$ is empty), but genotyped animals without phenotypes (e.g., genotyped sires) could also be included: they are part of $\mathbf{a}_2$ even if they have no record in $\mathbf{y}$.
+
+The variable $J$ is the number of markers kept after QC (see Genotype data). Note that $K_g = n_{a_2}$: the rows of $\mathbf{Z}$ are the animals in $\mathbf{a}_2$.
+
+## Definition of column vector $\mathbf{g}$
+
+The vector of random additive genetic effects of the markers is $\mathbf{g}$.
+
+The variance of this random column vector is:
+$$
+\text{Var}\left[ \mathbf{g} \right] =
+\mathbf{I}\sigma^2_g
+$$
+
+Therefore:
+
+$$
+\text{Var}\left[ \mathbf{Zg} \right] = 
+\text{Cov}\left[ \mathbf{Zg, g^\top Z^\top} \right] \\ \ 
+= \mathbf{Z} \text{Cov}\left[ \mathbf{g, g^\top } \right] \mathbf{Z}^\top \\ \
+= \mathbf{Z} \text{Var}\left[ \mathbf{g} \right] \mathbf{Z}^\top \\ \
+= \mathbf{Z}  \mathbf{I} \sigma^2_g \mathbf{Z}^\top \\ \
+=\mathbf{Z} \mathbf{Z}^\top  \sigma^2_g
+$$
+
+### Definition of the variance component $\sigma^2_g$
+
+The variance of the additive effect of each marker is $\sigma^2_g$ (a scalar, the marker variance component). It is the same for all markers.
+
+It is assumed that:
+$$
+g_j \sim N(0, \sigma^2_g) \ \ ; \ \ \forall j \in \{1, ..., J\} \\ \
+\text{Cov}\left[ g_j, g_{j'}\right] = 0 \ \ ; \ \ \forall j \neq j'
+$$
+
+This is the same as $\text{Var}\left[ \mathbf{g} \right] = \mathbf{I}\sigma^2_g$, written element by element.
+
+
+## Definition of matrix $\mathbf{G}$
+
+To build $\mathbf{G}$, we need the link between the marker variance $\sigma^2_g$ and the additive genetic variance $\sigma^2_a$. For this, the dosage $m_{ij}$ (animal $i$, marker $j$) is treated as a random variable: the genotype of a random animal from a population in Hardy-Weinberg equilibrium, with allele frequency $p_j$ and $q_j = 1 - p_j$. Then, $\mathbb{P}(m_{ij} = 0) = (1-p_j)^2$, $\mathbb{P}(m_{ij} = 1) = 2(1-p_j)p_j$ and $\mathbb{P}(m_{ij} = 2) = p_j^2$.
+
+By variance rules:
+$$
+\text{Var}\left[m_{ij}\right] = 
+\mathbb{E}\left[m^2_{ij}\right] -
+\left(\mathbb{E}\left[m_{ij}\right]\right)^2
+$$
+
+Where (see Definition of matrix $\mathbf{Z}$):
+$$
+\mathbb{E}\left[m_{ij}\right] = 2p_j \\ \
+\implies \left( \mathbb{E}\left[m_{ij}\right] \right)^2 = 4p_j^2
+$$
+
+And:
+$$
+\mathbb{E}\left[m^2_{ij}\right] =
+0^2 \times (1-p_j)^2 + 1^2 \times 2(1-p_j)p_j + 2^2 \times p_j^2 \\ \
+= 2p_j - 2p_j^2 + 4p_j^2 \\ \
+= 2p_j + 2p_j^2
+$$
+
+Therefore:
+$$
+\text{Var}\left[m_{ij}\right] = 
+\mathbb{E}\left[m^2_{ij}\right] -
+\left(\mathbb{E}\left[m_{ij}\right]\right)^2 \\ \
+= 2p_j + 2p_j^2 - 4p_j^2 \\ \
+= 2p_j - 2p_j^2 \\ \
+= 2p_j(1 - p_j) \\ \
+= 2p_jq_j
+$$
+
+The centered dosage $z_{ij} = m_{ij} - 2p_j$ only shifts $m_{ij}$ by a constant. Then:
+$$
+\mathbb{E}\left[z_{ij}\right] = 0 \\ \
+\text{Var}\left[z_{ij}\right] = \mathbb{E}\left[z^2_{ij}\right] = 2p_jq_j
+$$
+
+The additive genetic value of animal $i$ (element $i$ of $\mathbf{Zg}$) is the sum of the marker effects, each one weighted by the centered dosage of the animal:
+$$
+a_i = z_{i1}g_1 + z_{i2}g_2 + \dots + z_{iJ}g_J = \sum_{j=1}^J z_{ij}g_j
+$$
+
+It is assumed that the marker effects are independent of the genotypes. Since the $g_j$ have mean zero and are uncorrelated, the covariance between the terms of two different markers is zero:
+$$
+\text{Cov}\left[z_{ij}g_j, z_{ij'}g_{j'}\right] =
+\mathbb{E}\left[z_{ij}z_{ij'}\right]\mathbb{E}\left[g_jg_{j'}\right] = 0 \ \ ; \ \ \forall j \neq j'
+$$
+
+Note that this holds even if the dosages of two markers are correlated (linkage disequilibrium), because $\mathbb{E}\left[g_jg_{j'}\right] = 0$. Then:
+$$
+\text{Var}\left[a_i\right] =
+\sum_{j=1}^J \text{Var}\left[z_{ij}g_j\right] \\ \
+= \sum_{j=1}^J \mathbb{E}\left[z^2_{ij}\right]\mathbb{E}\left[g^2_j\right] \\ \
+= \sum_{j=1}^J 2p_jq_j\sigma^2_g \\ \
+= 2\sum_{j=1}^J p_jq_j \ \sigma^2_g
+$$
+
+The additive genetic variance of an animal is $\sigma^2_a = \text{Var}\left[a_i\right]$. Then, the connection between $\sigma^2_g$ and $\sigma^2_a$ is:
+$$
+\sigma^2_a = 2\sum_{j=1}^J p_jq_j \ \sigma^2_g \\ \
+\implies \sigma^2_g = \frac{\sigma^2_a}{2\sum_{j=1}^J p_jq_j}
+$$
+
+Using this connection, and with $\mathbf{Z}$ fixed (the observed genotypes):
+$$
+\text{Var}\left[ \mathbf{Zg} \right] = 
+\text{Cov}\left[ \mathbf{Zg, g^\top Z^\top} \right] \\ \ 
+= \mathbf{Z} \text{Cov}\left[ \mathbf{g, g^\top } \right] \mathbf{Z}^\top \\ \
+= \mathbf{Z} \text{Var}\left[ \mathbf{g} \right] \mathbf{Z}^\top \\ \
+= \mathbf{Z}  \mathbf{I} \sigma^2_g \mathbf{Z}^\top \\ \
+=\mathbf{Z} \mathbf{Z}^\top  \sigma^2_g \\ \
+= \mathbf{Z} \mathbf{Z}^\top  \frac{\sigma^2_a}{2\sum_{j=1}^J p_jq_j} \\ \
+= \frac{\mathbf{Z} \mathbf{Z}^\top}{2\sum_{j=1}^J p_jq_j} \sigma^2_a \\ \
+= \mathbf{G} \sigma^2_a
+$$
+
+Where $\mathbf{G} = \frac{\mathbf{Z} \mathbf{Z}^\top}{2\sum_{j=1}^J p_jq_j} \in \mathbb{R}^{K_g \times K_g}$ is the genomic relationship matrix (VanRaden, 2008). The $p_j$ should be the allele frequencies of the base population. As they are unknown, the frequencies of the genotyped animals are used (the same $p_j$ used to center $\mathbf{Z}$).
+
+This last expression connects the marker model (marker effects $\mathbf{g}$, with variance component $\sigma^2_g$) with the animal model (additive effects $\mathbf{a}$, with variance component $\sigma^2_a$). Since $\mathbf{a}_2 = \mathbf{Zg}$, then $\text{Var}\left[\mathbf{a}_2\right] = \mathbf{G}\sigma^2_a$. For genotyped animals, $\mathbf{G}$ replaces $\mathbf{A}_{22}$, the pedigree relationships (see Variance of $\mathbf{a}$).
+
+## Calculation of matrix $\mathbf{G}$
+
+$\mathbf{G} = \frac{\mathbf{Z} \mathbf{Z}^\top}{2\sum_{j=1}^J p_jq_j}$ (see Definition of matrix $\mathbf{G}$), where $p_j$ are the same allele frequencies used to center $\mathbf{Z}$ (vector `p`, computed after QC).
+
+$\mathbf{Z}$ is large ($K_g \times J$ = `r nrow(Z)` $\times$ `r ncol(Z)`), but $\mathbf{G}$ is small ($K_g \times K_g$). `tcrossprod(Z)` computes $\mathbf{Z}\mathbf{Z}^\top$ in one optimized (BLAS) call, without building $\mathbf{Z}^\top$. The rows of $\mathbf{Z}$ are already in the order of $\mathbf{a}_2$ (see Align $\mathbf{Z}$), so $\mathbf{G}$ follows the order of the genotyped animals in $\mathbf{A}_{\text{ord}}$.
+```{r}
+stopifnot(length(p) == ncol(Z)) # One p_j per column (marker) of Z.
+k <- 2 * sum(p * (1 - p))       # Denominator: 2 * sum_j p_j q_j.
+k
+
+G <- tcrossprod(Z) / k          # Z Z' / k.
+dimnames(G) <- list(rownames(Z), rownames(Z))
+dim(G)
+G[1:3, 1:3]
+```
+
+Checks:
+
+1. $\mathbf{G}$ is symmetric.
+2. Rows and columns of $\mathbf{G}$ follow $\mathbf{a}_2$, the same order as $\mathbf{A}_{22}$.
+3. Every row of $\mathbf{G}$ adds up to zero. Each column of $\mathbf{Z}$ has mean zero, so $\mathbf{Z}^\top\mathbf{1} = \mathbf{0}$ and $\mathbf{G}\mathbf{1} = \mathbf{Z}(\mathbf{Z}^\top\mathbf{1})/k = \mathbf{0}$.
+```{r}
+stopifnot(isSymmetric(G))
+stopifnot(identical(rownames(G), a2_ids), identical(rownames(G), rownames(A22)))
+stopifnot(max(abs(rowSums(G))) < 1e-8)
+```
+
+
+Is $\mathbf{G}$ invertible?
+```{r}
+ev <- eigen(G, symmetric = TRUE, only.values = TRUE)$values
+range(ev)                 # Smallest and largest eigenvalues.
+qr(G)$rank; nrow(G)       # Rank vs number of genotyped animals.
+```
+
+$\mathbf{G}$ is singular: since $\mathbf{G}\mathbf{1} = \mathbf{0}$ (check 3), its rank is at most $K_g - 1$ and its smallest eigenvalue is zero (up to rounding). Then $\mathbf{G}^{-1}$ does not exist, but $\mathbf{H}^{-1}$ (Aguilar et al., 2010) needs it. Before computing $\mathbf{G}^{-1}$, $\mathbf{G}$ must be made invertible (see Blending $\mathbf{G}$).
+
+### Blending $\mathbf{G}$
+
+$\mathbf{G}$ is singular, so it is blended with $\mathbf{A}_{22}$:
+$$
+\mathbf{G}_w = (1 - w)\mathbf{G} + w\mathbf{A}_{22}
+$$
+
+Where $w \in (0, 1)$ is a small weight. I use $w = 0.05$, a common default (e.g., in BLUPF90).
+
+**Meaning of $w$.** The markers may not capture all the additive genetic variance. Then, the additive effect of a genotyped animal is split into a part explained by the markers and a residual polygenic part $\mathbf{u}$, which follows the pedigree and is independent of $\mathbf{g}$:
+$$
+\mathbf{a}_2 = \mathbf{Zg} + \mathbf{u} \\ \
+\text{Var}\left[\mathbf{Zg}\right] = (1 - w)\,\mathbf{G}\sigma^2_a \\ \
+\text{Var}\left[\mathbf{u}\right] = w\,\mathbf{A}_{22}\sigma^2_a \\ \ \\ \
+\implies
+\text{Var}\left[\mathbf{a}_2\right] = (1 - w)\,\mathbf{G}\sigma^2_a + w\,\mathbf{A}_{22}\sigma^2_a = \mathbf{G}_w\sigma^2_a
+$$
+That is, the markers explain a proportion $1 - w$ of $\sigma^2_a$, and the pedigree the remaining $w$. With $w = 0$ (no blending), $\mathbf{a}_2 = \mathbf{Zg}$, as in Definition of matrix $\mathbf{G}$.
+
+```{r}
+w <- 0.05
+Gw <- (1 - w) * G + w * A22
+stopifnot(isSymmetric(Gw), identical(dimnames(Gw), dimnames(A22)))
+Gw[1:3, 1:3]
+
+# Smallest and largest eigenvalues, before (G) and after (Gw) blending.
+# Gw is positive definite: its smallest eigenvalue is at least w * (smallest eigenvalue of A22).
+range(eigen(G, symmetric = TRUE, only.values = TRUE)$values)
+ev_w <- eigen(Gw, symmetric = TRUE, only.values = TRUE)$values
+range(ev_w)
+w * min(eigen(A22, symmetric = TRUE, only.values = TRUE)$values)
+stopifnot(min(ev_w) > 0)
+```
+
+Inverse of $\mathbf{G}_w$, needed for $\mathbf{H}^{-1}$ (Aguilar et al., 2010). `chol()` computes the Cholesky factor (it stops if $\mathbf{G}_w$ is not positive definite), and `chol2inv()` the inverse from it. This is faster and more stable than `solve()` for a symmetric positive definite matrix.
+```{r}
+Gw_inv <- chol2inv(chol(Gw))
+dimnames(Gw_inv) <- dimnames(Gw)
+stopifnot(max(abs(Gw %*% Gw_inv - diag(nrow(Gw)))) < 1e-8) # Gw Gw^-1 = I.
+```
+
+**Effect of blending on the variance of $\mathbf{a}$ (sections below).** The derivation of $\text{Var}\left[\mathbf{a}\right]$ below uses only that $\text{Var}\left[\mathbf{a}_2\right] = \mathbf{G}\sigma^2_a$, with $\mathbf{G}$ symmetric. It does not use how $\mathbf{G}$ is built. Then, with blending, every step and result holds with $\mathbf{G}_w$ in place of $\mathbf{G}$: from here on, $\mathbf{G}$ in the formulas stands for the matrix actually used, $\mathbf{G}_w$. For example:
+$$
+\text{Var}\left[\mathbf{a}_2\right] = \mathbf{G}_w\sigma^2_a \\ \
+\text{Var}\left[\mathbf{a}_1\right] =
+\left[ \mathbf{A}_{11} + \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \left( \mathbf{G}_w - \mathbf{A}_{22} \right) \mathbf{A}_{22}^{-1}\mathbf{A}_{21} \right] \sigma^2_a \\ \
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_2^\top\right] = \mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{G}_w \sigma^2_a
+$$
+
+Since $\mathbf{G}_w - \mathbf{A}_{22} = (1 - w)\mathbf{G} + w\mathbf{A}_{22} - \mathbf{A}_{22} = (1 - w)\left(\mathbf{G} - \mathbf{A}_{22}\right)$, blending shrinks the genomic correction of the non-genotyped animals by $(1 - w)$:
+$$
+\text{Var}\left[\mathbf{a}_1\right] =
+\left[ \mathbf{A}_{11} + (1 - w)\,\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \left( \mathbf{G} - \mathbf{A}_{22} \right) \mathbf{A}_{22}^{-1}\mathbf{A}_{21} \right] \sigma^2_a
+$$
+
+In the same way, the whole matrix is $\mathbf{H}_w = (1 - w)\mathbf{H} + w\mathbf{A}$ (see Full expression of the variance of $\mathbf{a}$): a weighted average of $\mathbf{H}$ built with the unblended $\mathbf{G}$ (weight $1 - w$) and the pedigree matrix $\mathbf{A}$ (weight $w$). In $\mathbf{H}^{-1}$, $\mathbf{G}^{-1}$ is $\mathbf{G}_w^{-1}$ (`Gw_inv`).
+
+Note: blending fixes the singularity of $\mathbf{G}$, but not the difference in scale between $\mathbf{G}$ and $\mathbf{A}_{22}$. That is a separate step (tuning), not done here.
+
+
+## Variance of $\mathbf{a}$
+
+With $\mathbf{G}$ defined, the variance of $\mathbf{a} = \begin{pmatrix} \mathbf{a}_1 \\ \mathbf{a}_2 \end{pmatrix}$ (animals in the order of $\mathbf{A}_{\text{ord}}$) is written in blocks.
+
+A first (naive) approach is to replace $\mathbf{A}_{22}$ by $\mathbf{G}$ and keep the other blocks of $\mathbf{A}$:
+$$
+\text{Var}\left[\begin{pmatrix} \mathbf{a}_1 \\ \mathbf{a}_2 \end{pmatrix}\right]
+=
+\begin{pmatrix}
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_1^\top \right] &
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_2^\top \right] \\
+\text{Cov}\left[\mathbf{a}_2, \mathbf{a}_1^\top \right] &
+\text{Cov}\left[\mathbf{a}_2, \mathbf{a}_2^\top \right]
+\end{pmatrix}
+$$
+
+Where:
+$$
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_1^\top \right] = 
+\text{Var}\left[ \mathbf{a}_1 \right] = 
+\mathbf{A}_{11} \sigma^2_a \\[8pt]
+\text{Cov}\left[\mathbf{a}_2, \mathbf{a}_2^\top \right] = 
+\text{Var}\left[ \mathbf{a}_2 \right] = 
+\mathbf{G} \sigma^2_a \\[8pt]
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_2^\top \right] = 
+\mathbf{A}_{12} \sigma^2_a \\[8pt]
+\text{Cov}\left[\mathbf{a}_2, \mathbf{a}_1^\top \right] = 
+\mathbf{A}_{21} \sigma^2_a  = \left( \mathbf{A}_{12} \sigma^2_a \right)^\top\\[8pt]
+$$
+
+Then:
+$$
+\text{Var}\left[\begin{pmatrix} \mathbf{a}_1 \\ \mathbf{a}_2 \end{pmatrix}\right]
+=
+\begin{pmatrix}
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_1^\top \right] &
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_2^\top \right] \\
+\text{Cov}\left[\mathbf{a}_2, \mathbf{a}_1^\top \right] &
+\text{Cov}\left[\mathbf{a}_2, \mathbf{a}_2^\top \right]
+\end{pmatrix} \\ \ \\ \
+= 
+\begin{pmatrix}
+\mathbf{A}_{11} \sigma^2_a &
+\mathbf{A}_{12} \sigma^2_a \\
+\mathbf{A}_{21} \sigma^2_a & 
+\mathbf{G} \sigma^2_a
+\end{pmatrix} \\ \ \\ \
+= 
+\begin{pmatrix}
+\mathbf{A}_{11} &
+\mathbf{A}_{12} \\
+\mathbf{A}_{21} & 
+\mathbf{G}
+\end{pmatrix} \sigma^2_a \\ \ \\ \
+= 
+\left[ 
+\begin{pmatrix}
+\mathbf{A}_{11} &
+\mathbf{A}_{12} \\
+\mathbf{A}_{21} & 
+\mathbf{A}_{22}
+\end{pmatrix}
++
+\begin{pmatrix}
+\mathbf{0}_{11} &
+\mathbf{0}_{12} \\
+\mathbf{0}_{21} & 
+\mathbf{G} - \mathbf{A}_{22}
+\end{pmatrix}
+\right]\sigma^2_a \\ \ \\ \
+= 
+\left[ 
+\mathbf{A}
++
+\begin{pmatrix}
+\mathbf{0}_{11} &
+\mathbf{0}_{12} \\
+\mathbf{0}_{21} & 
+\mathbf{G} - \mathbf{A}_{22}
+\end{pmatrix}
+\right]\sigma^2_a
+$$
+
+However, this is not correct. The non-genotyped animals are related to the genotyped animals through the pedigree, so when $\text{Var}\left[\mathbf{a}_2\right]$ changes from $\mathbf{A}_{22}\sigma^2_a$ to $\mathbf{G}\sigma^2_a$, $\text{Var}\left[\mathbf{a}_1\right]$ and $\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_2^\top\right]$ change too. The correct blocks are derived below.
+
+Recall (see Use of pedigree to propagate genomic information): the conditional expectation of $\mathbf{a}_1$ given $\mathbf{a}_2$ is given by the pedigree, with $\Sigma_{\mathbf{a}_1\mathbf{a}_2} = \mathbf{A}_{12}\sigma^2_a$ and $\Sigma_{\mathbf{a}_2\mathbf{a}_2} = \mathbf{A}_{22}\sigma^2_a$:
+$$
+\mathbb{E}[\mathbf{a}_1 | \mathbf{a}_2] = 
+\Sigma_{\mathbf{a}_1\mathbf{a}_2}
+\Sigma_{\mathbf{a}_2\mathbf{a}_2}^{-1}
+\mathbf{a}_2 \\ \
+= 
+\mathbf{A}_{12} \sigma^2_a \left( \mathbf{A}_{22} \sigma^2_a \right)^{-1}\mathbf{a}_2  \\ \
+= 
+\mathbf{A}_{12} \sigma^2_a \mathbf{A}_{22}^{-1} \frac{1}{\sigma^2_a} \mathbf{a}_2  \\ \
+=
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{a}_2 \\ \
+=
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{Zg}
+$$
+
+Then, $\mathbf{a}_1$ can be written as its conditional expectation plus a deviation $\boldsymbol{\varepsilon}$:
+$$
+\mathbf{a}_1 = 
+\mathbb{E}[\mathbf{a}_1 | \mathbf{a}_2] + \boldsymbol{\varepsilon} \\ \
+=
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{a}_2 + \boldsymbol{\varepsilon} \\ \
+=
+\mathbf{D}\mathbf{a}_2 + \boldsymbol{\varepsilon}
+\\ \ \\ \
+\implies 
+\boldsymbol{\varepsilon} = \mathbf{a}_1 - \mathbf{D}\mathbf{a}_2 
+$$
+
+Where $\mathbf{D} = \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \in \mathbb{R}^{n_{a_1} \times n_{a_2}}$. The term $\mathbf{D}\mathbf{a}_2$ is the part of $\mathbf{a}_1$ predicted from the genotyped animals through the pedigree, and $\boldsymbol{\varepsilon}$ is the part that $\mathbf{a}_2$ cannot explain (e.g., the Mendelian sampling of the non-genotyped animals).
+
+**Key assumption** (Legarra et al., 2009). The genomic information changes only the distribution of $\mathbf{a}_2$: $\text{Var}\left[\mathbf{a}_2\right] = \mathbf{G}\sigma^2_a$, instead of $\mathbf{A}_{22}\sigma^2_a$. The link between $\mathbf{a}_1$ and $\mathbf{a}_2$ ($\mathbf{D}$ and $\boldsymbol{\varepsilon}$) is still the one given by the pedigree. Then, $\boldsymbol{\varepsilon}$ and its variance are computed with the pedigree (co)variances, written below as $\text{Var}_{\mathbf{A}}$ and $\text{Cov}_{\mathbf{A}}$:
+$$
+\text{Var}_{\mathbf{A}}\left[\mathbf{a}_1\right] = \mathbf{A}_{11}\sigma^2_a \\ \
+\text{Var}_{\mathbf{A}}\left[\mathbf{a}_2\right] = \mathbf{A}_{22}\sigma^2_a \\ \
+\text{Cov}_{\mathbf{A}}\left[\mathbf{a}_1, \mathbf{a}_2^\top\right] = \mathbf{A}_{12}\sigma^2_a \\ \
+\text{Cov}_{\mathbf{A}}\left[\mathbf{a}_2, \mathbf{a}_1^\top\right] = \mathbf{A}_{21}\sigma^2_a
+$$
+
+Then:
+$$
+\text{Var}\left[\mathbf{a}_1\right] = 
+\text{Var}\left[\mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{a}_2 + 
+\boldsymbol{\varepsilon}\right] \\ \ 
+= 
+\text{Var}\left[\mathbf{D}\mathbf{a}_2 + 
+\boldsymbol{\varepsilon}\right]
+$$
+
+### Covariance between $\mathbf{D}\mathbf{a}_2$ and $\boldsymbol{\varepsilon}$
+
+The deviation $\boldsymbol{\varepsilon}$ is uncorrelated with $\mathbf{a}_2$:
+$$
+\text{Cov}_{\mathbf{A}}\left[ \mathbf{a}_2, \boldsymbol{\varepsilon}^\top \right] =
+\text{Cov}_{\mathbf{A}}\left[ \mathbf{a}_2, \left( \mathbf{a}_1 - \mathbf{D}\mathbf{a}_2 \right)^\top \right] \\ \
+=
+\text{Cov}_{\mathbf{A}}\left[ \mathbf{a}_2, \mathbf{a}_1^\top \right] -
+\text{Cov}_{\mathbf{A}}\left[ \mathbf{a}_2, \mathbf{a}_2^\top \right] \mathbf{D}^\top \\ \
+=
+\mathbf{A}_{21}\sigma^2_a - \mathbf{A}_{22}\sigma^2_a \mathbf{A}_{22}^{-1}\mathbf{A}_{21} \\ \
+=
+\mathbf{A}_{21}\sigma^2_a - \mathbf{A}_{21}\sigma^2_a \\ \
+=
+\mathbf{0} \in \mathbb{R}^{n_{a_2} \times n_{a_1}}
+$$
+
+By the key assumption, $\boldsymbol{\varepsilon}$ stays independent of $\mathbf{a}_2$ when $\text{Var}\left[\mathbf{a}_2\right]$ changes to $\mathbf{G}\sigma^2_a$. Then:
+$$
+\text{Cov}\left[ \mathbf{D}\mathbf{a}_2, \boldsymbol{\varepsilon}^\top \right] 
+=
+\text{Cov}\left[ \boldsymbol{\varepsilon}, \left( \mathbf{D}\mathbf{a}_2 \right)^\top \right]^\top
+=
+\mathbf{0} \in \mathbb{R}^{n_{a_1} \times n_{a_1}}
+$$
+
+Therefore:
+$$
+\text{Var}\left[ \mathbf{a}_1 \right] = 
+\text{Var}\left[\mathbf{D}\mathbf{a}_2 + 
+\boldsymbol{\varepsilon}\right] \\ \
+= 
+\text{Var}\left[\mathbf{D}\mathbf{a}_2\right] + 
+\text{Var}\left[\boldsymbol{\varepsilon}\right]
+$$
+
+### Variance of $\mathbf{D}\mathbf{a}_2$
+
+Here, $\text{Var}\left[\mathbf{a}_2\right] = \mathbf{G}\sigma^2_a$ (genomic information). Note that $\mathbf{D}^\top = \left( \mathbf{A}_{12} \mathbf{A}_{22}^{-1}\right)^\top = \left(\mathbf{A}_{22}^{-1}\right)^\top \mathbf{A}_{12}^\top = \mathbf{A}_{22}^{-1}\mathbf{A}_{21}$, because $\mathbf{A}_{22}^{-1}$ is symmetric and $\mathbf{A}_{12}^\top = \mathbf{A}_{21}$.
+$$
+\text{Var}\left[\mathbf{D}\mathbf{a}_2\right] 
+=
+\text{Cov}\left[\mathbf{D}\mathbf{a}_2, \left( \mathbf{D}\mathbf{a}_2 \right)^\top\right] \\ \
+=
+\mathbf{D}\text{Cov}\left[\mathbf{a}_2, \mathbf{a}_2 ^\top\right]\mathbf{D}^\top \\ \
+=
+\mathbf{D}\text{Var}\left[\mathbf{a}_2\right]\mathbf{D}^\top \\ \
+=
+\mathbf{D}\mathbf{G}\sigma^2_a\mathbf{D}^\top \\ \
+=
+\sigma^2_a \mathbf{D}\mathbf{G}\mathbf{D}^\top \\ \
+=
+\sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{G} 
+\left( \mathbf{A}_{12} \mathbf{A}_{22}^{-1}\right)^\top \\ \
+=
+\sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{G} 
+\mathbf{A}_{22}^{-1}\mathbf{A}_{21}
+$$
+
+### Variance of $\boldsymbol{\varepsilon}$
+
+Here, all (co)variances are the pedigree ones (see the key assumption above):
+$$
+\text{Var}\left[\boldsymbol{\varepsilon}\right] 
+= 
+\text{Var}_{\mathbf{A}}\left[\mathbf{a}_1 - 
+\mathbf{A}_{12}  \mathbf{A}_{22}^{-1}\mathbf{a}_2 \right]  \\ \ 
+=
+\text{Var}_{\mathbf{A}}\left[\mathbf{a}_1\right] +
+\text{Var}_{\mathbf{A}}\left[-\mathbf{A}_{12}  \mathbf{A}_{22}^{-1}\mathbf{a}_2 \right] +
+\text{Cov}_{\mathbf{A}}\left[\mathbf{a}_1, 
+\left( -\mathbf{A}_{12}  \mathbf{A}_{22}^{-1}\mathbf{a}_2 \right)^\top\right] +
+\text{Cov}_{\mathbf{A}}\left[-\mathbf{A}_{12}  \mathbf{A}_{22}^{-1}\mathbf{a}_2, \mathbf{a}_1^\top\right] \\ \
+=
+\text{Var}_{\mathbf{A}}\left[\mathbf{a}_1\right] +
+\text{Var}_{\mathbf{A}}\left[-\mathbf{D}\mathbf{a}_2 \right] +
+\text{Cov}_{\mathbf{A}}\left[\mathbf{a}_1, 
+\left( -\mathbf{D}\mathbf{a}_2 \right)^\top\right] +
+\text{Cov}_{\mathbf{A}}\left[-\mathbf{D}\mathbf{a}_2, \mathbf{a}_1^\top\right]
+$$
+
+Segment $\text{Var}_{\mathbf{A}}\left[\mathbf{a}_1\right]$:
+$$
+\text{Var}_{\mathbf{A}}\left[\mathbf{a}_1\right] = \mathbf{A}_{11} \sigma^2_a
+$$
+
+Segment $\text{Var}_{\mathbf{A}}\left[-\mathbf{D}\mathbf{a}_2 \right]$:
+$$
+\text{Var}_{\mathbf{A}}\left[-\mathbf{D}\mathbf{a}_2 \right] =
+\text{Cov}_{\mathbf{A}}\left[ 
+-\mathbf{D}\mathbf{a}_2 , \left( -\mathbf{D} \mathbf{a}_2 \right)^\top
+\right] \\ \
+=
+\text{Cov}_{\mathbf{A}} \left[ 
+-\mathbf{D}\mathbf{a}_2 ,  \mathbf{a}_2^\top\mathbf{D}^\top(-1)
+\right] \\ \
+=
+(-1)\mathbf{D}\text{Var}_{\mathbf{A}}\left[ \mathbf{a}_2 \right]\mathbf{D}^\top(-1) \\ \
+= \mathbf{D} \mathbf{A}_{22} \sigma^2_a \mathbf{D}^\top \\ \ 
+= \sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{22} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} \\ \ 
+= \sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21}
+$$
+
+Segment $\text{Cov}_{\mathbf{A}}\left[\mathbf{a}_1,  \mathbf{a}_2^\top\mathbf{D}^\top(-1)\right]$:
+$$
+\text{Cov}_{\mathbf{A}}\left[\mathbf{a}_1,  \mathbf{a}_2^\top\mathbf{D}^\top(-1)\right]
+= 
+\text{Cov}_{\mathbf{A}}\left[ 
+\mathbf{a}_1, \mathbf{a}_2^\top
+\right] \mathbf{D}^\top(-1) \\ \
+=
+- \sigma^2_a \mathbf{A}_{12} \mathbf{D}^\top \\ \
+=
+- \sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21}
+$$
+
+Segment $\text{Cov}_{\mathbf{A}}\left[-\mathbf{D}\mathbf{a}_2, \mathbf{a}_1^\top\right]$:
+$$
+\text{Cov}_{\mathbf{A}}\left[-\mathbf{D}\mathbf{a}_2, \mathbf{a}_1^\top\right] =
+(-1)\mathbf{D}\text{Cov}_{\mathbf{A}}\left[\mathbf{a}_2, \mathbf{a}_1^\top\right] \\ \
+=
+-\sigma^2_a \mathbf{D} \mathbf{A}_{21} \\ \
+=
+-\sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21}
+$$
+
+Adding the four segments:
+$$
+\text{Var}\left[\boldsymbol{\varepsilon}\right] =
+\mathbf{A}_{11} \sigma^2_a +
+\sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} -
+\sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} -
+\sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} \\ \
+=
+\left( \mathbf{A}_{11} - \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} \right) \sigma^2_a
+$$
+
+
+### Variance of $\mathbf{a}_1$
+
+This establishes the connection between $\mathbf{a}_1$ and $\mathbf{a}_2$ via the required sub-matrices of the numerator relationship matrix ($\mathbf{A}_{11}$, $\mathbf{A}_{12}$, $\mathbf{A}_{21}$, $\mathbf{A}_{22}$) and the marker information ($\mathbf{G}$). Joining the two variances:
+$$
+\text{Var}\left[\mathbf{a}_1\right] =
+\text{Var}\left[\mathbf{D}\mathbf{a}_2\right] + 
+\text{Var}\left[\boldsymbol{\varepsilon}\right] \\ \
+=
+\sigma^2_a \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{G} \mathbf{A}_{22}^{-1}\mathbf{A}_{21} +
+\left( \mathbf{A}_{11} - \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} \right) \sigma^2_a \\ \
+=
+\left( \mathbf{A}_{11} +
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{G} \mathbf{A}_{22}^{-1}\mathbf{A}_{21} -
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} \right) \sigma^2_a
+$$
+
+To factor the last two terms, write $\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} = \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{22} \mathbf{A}_{22}^{-1} \mathbf{A}_{21}$ (because $\mathbf{A}_{22}\mathbf{A}_{22}^{-1} = \mathbf{I}$):
+$$
+\text{Var}\left[\mathbf{a}_1\right] =
+\left( \mathbf{A}_{11} +
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{G} \mathbf{A}_{22}^{-1}\mathbf{A}_{21} -
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \mathbf{A}_{22} \mathbf{A}_{22}^{-1} \mathbf{A}_{21} \right) \sigma^2_a \\ \
+=
+\left[ \mathbf{A}_{11} +
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \left( \mathbf{G} - \mathbf{A}_{22} \right) \mathbf{A}_{22}^{-1}\mathbf{A}_{21} \right] \sigma^2_a \\ \
+=
+\mathbf{H}_{11} \sigma^2_a
+$$
+
+Where $\mathbf{H}_{11} = \mathbf{A}_{11} + \mathbf{A}_{12} \mathbf{A}_{22}^{-1} \left( \mathbf{G} - \mathbf{A}_{22} \right) \mathbf{A}_{22}^{-1}\mathbf{A}_{21}$ is the block of $\mathbf{H}$ for the non-genotyped animals (Legarra et al., 2009).
+
+Interpretation:
+
+- $\mathbf{A}_{11}$ is the pedigree relationship among non-genotyped animals.
+
+- $\mathbf{G} - \mathbf{A}_{22}$ is what the markers add to (or remove from) the pedigree relationships among genotyped animals.
+
+- $\mathbf{A}_{12} \mathbf{A}_{22}^{-1}$ propagates this difference to the non-genotyped animals, through their pedigree relationships with the genotyped animals.
+
+- If $\mathbf{G} = \mathbf{A}_{22}$, then $\text{Var}\left[\mathbf{a}_1\right] = \mathbf{A}_{11}\sigma^2_a$ (pedigree only).
+
+
+### Variance of $\mathbf{a}_2$
+
+By definition of $\mathbf{G}$ (see Definition of matrix $\mathbf{G}$):
+$$
+\text{Var}\left[\mathbf{a}_2\right] = \mathbf{G} \sigma^2_a
+$$
+
+### Covariance between $\mathbf{a}_1$ and $\mathbf{a}_2$ and vice versa
+
+$$
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_2^\top\right] =
+\text{Cov}\left[\mathbf{Da}_2 + \boldsymbol{\varepsilon}, 
+\mathbf{a}_2^\top\right] \\ \
+= \text{Cov}\left[
+\mathbf{Da}_2, \mathbf{a}_2^\top
+\right] +
+\text{Cov}\left[
+\boldsymbol{\varepsilon}, \mathbf{a}_2^\top
+\right]
+$$
+
+Where:
+$$
+\text{Cov}\left[
+\mathbf{Da}_2, \mathbf{a}_2^\top
+\right] =
+\mathbf{D}\text{Cov}\left[ \mathbf{a}_2, \mathbf{a}_2^\top \right] \\ \
+= \mathbf{D}\text{Var}\left[ \mathbf{a}_2\right] \\ \
+= \mathbf{D} \mathbf{G}\sigma^2_a \\ \
+= \mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{G} \sigma^2_a
+$$
+
+And, with the pedigree (co)variances (see the key assumption above):
+$$
+\text{Cov}_{\mathbf{A}}\left[
+\boldsymbol{\varepsilon}, \mathbf{a}_2^\top
+\right] = 
+\text{Cov}_{\mathbf{A}}\left[
+\mathbf{a}_1 - \mathbf{Da}_2, \mathbf{a}_2^\top
+\right] \\ \
+=
+\text{Cov}_{\mathbf{A}}\left[
+\mathbf{a}_1 , \mathbf{a}_2^\top
+\right] +
+\text{Cov}_{\mathbf{A}}\left[
+- \mathbf{Da}_2 , \mathbf{a}_2^\top
+\right] \\ \
+=
+\sigma^2_a\mathbf{A}_{12} - 
+\sigma^2_a\mathbf{A}_{12}\mathbf{A}_{22}^{-1}\mathbf{A}_{22} \\ \
+= \sigma^2_a\mathbf{A}_{12} - \sigma^2_a\mathbf{A}_{12} \\ \
+= \mathbf{0} \in \mathbb{R}^{n_{a_1} \times n_{a_2}}
+$$
+
+This is the transpose of $\text{Cov}_{\mathbf{A}}\left[ \mathbf{a}_2, \boldsymbol{\varepsilon}^\top \right] = \mathbf{0}$, shown above. By the key assumption, it also holds with genomic information: $\text{Cov}\left[ \boldsymbol{\varepsilon}, \mathbf{a}_2^\top \right] = \mathbf{0}$.
+
+Then:
+$$
+\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_2^\top\right] =
+\text{Cov}\left[
+\mathbf{Da}_2, \mathbf{a}_2^\top
+\right] +
+\text{Cov}\left[
+\boldsymbol{\varepsilon}, \mathbf{a}_2^\top
+\right] \\ \
+= 
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{G} \sigma^2_a + \mathbf{0} \\ \
+=
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{G} \sigma^2_a
+$$
+
+And its transpose:
+$$
+\text{Cov}\left[\mathbf{a}_2, \mathbf{a}_1^\top\right] =
+\left(\text{Cov}\left[\mathbf{a}_1, \mathbf{a}_2^\top\right] \right)^\top \\ \
+=
+\left( \mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{G} \sigma^2_a \right)^\top \\ \
+=
+\mathbf{G}^\top \left(\mathbf{A}_{22}^{-1}\right)^\top \mathbf{A}_{12}^\top \sigma^2_a \\ \
+=
+\mathbf{GA}_{22}^{-1}\mathbf{A}_{21} \sigma^2_a
+$$
+
+Because $\mathbf{G}$ and $\mathbf{A}_{22}^{-1}$ are symmetric, and $\mathbf{A}_{12}^\top = \mathbf{A}_{21}$.
+
+### Full expression of the variance of $\mathbf{a}$
+
+$$
+\text{Var}\left[ \mathbf{a} \right] =
+\text{Var}\left[
+\begin{pmatrix}
+\mathbf{a}_1 \\ \mathbf{a}_2
+\end{pmatrix}
+\right] \\ \
+=
+\begin{pmatrix}
+\left[ \mathbf{A}_{11} +
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \left( \mathbf{G} - \mathbf{A}_{22} \right) \mathbf{A}_{22}^{-1}\mathbf{A}_{21} \right] \sigma^2_a & 
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{G} \sigma^2_a \\
+\mathbf{GA}_{22}^{-1}\mathbf{A}_{21} \sigma^2_a &
+\mathbf{G} \sigma^2_a
+\end{pmatrix} \\ \ \\ \
+= 
+\begin{pmatrix}
+\left[ \mathbf{A}_{11} +
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \left( \mathbf{G} - \mathbf{A}_{22} \right) \mathbf{A}_{22}^{-1}\mathbf{A}_{21} \right]  & 
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{G} \\
+\mathbf{GA}_{22}^{-1}\mathbf{A}_{21}  &
+\mathbf{G}
+\end{pmatrix} \sigma^2_a \\ \ \\ \
+=
+\begin{pmatrix}
+\mathbf{H}_{11} &
+\mathbf{H}_{12} \\
+\mathbf{H}_{21}  &
+\mathbf{H}_{22}
+\end{pmatrix} \sigma^2_a
+$$
+Where:
+$$
+\mathbf{H}_{11} = 
+\left[ \mathbf{A}_{11} +
+\mathbf{A}_{12} \mathbf{A}_{22}^{-1} \left( \mathbf{G} - \mathbf{A}_{22} \right) \mathbf{A}_{22}^{-1}\mathbf{A}_{21} \right] \\ \ \\ \
+\mathbf{H}_{12} = \mathbf{A}_{12} \mathbf{A}_{22}^{-1}\mathbf{G} \\ \ \\ \
+\mathbf{H}_{21} =  \mathbf{GA}_{22}^{-1}\mathbf{A}_{21} \\ \ \\ \
+\mathbf{H}_{22} = \mathbf{G}
+$$
+
+Note that $\mathbf{H}_{21} = \mathbf{H}_{12}^\top$ (see Covariance between $\mathbf{a}_1$ and $\mathbf{a}_2$), so $\mathbf{H}$ is symmetric. Then:
+$$
+\text{Var}\left[ \mathbf{a} \right] = \mathbf{H} \sigma^2_a
+$$
+
+Where $\mathbf{H}$ is the relationship matrix that combines pedigree and genomic relationships (Legarra et al., 2009), with the animals in the order of $\mathbf{A}_{\text{ord}}$.
+
+## Definition of $\mathbf{H}^{-1}$
+
+**Aguilar *et al.* (2010)**
+
+The mixed model equations need $\mathbf{H}^{-1}$, not $\mathbf{H}$. Aguilar et al. (2010) showed that $\mathbf{H}^{-1}$ has a simple form:
+$$
+\mathbf{H}^{-1} = \mathbf{A}^{-1} +
+\begin{pmatrix}
+\mathbf{0} & \mathbf{0} \\
+\mathbf{0} & \mathbf{G}^{-1} - \mathbf{A}_{22}^{-1}
+\end{pmatrix}
+$$
+
+Where $\mathbf{A}^{-1}$ is the inverse of the full pedigree matrix (animals in the order of $\mathbf{A}_{\text{ord}}$), and $\mathbf{G}^{-1}$ is the inverse of the blended matrix, $\mathbf{G}_w^{-1}$ (`Gw_inv`). Only the block of the genotyped animals changes.
+
+## Calculation of $\mathbf{H}^{-1}$
+
+Three inverses are needed:
+
+1. $\mathbf{A}^{-1}$ (all animals, in the order of $\mathbf{A}_{\text{ord}}$).
+2. $\mathbf{A}_{22}^{-1}$ (the inverse of the block $\mathbf{A}_{22}$, not the 22 block of $\mathbf{A}^{-1}$).
+3. $\mathbf{G}_w^{-1}$ (`Gw_inv`, see Blending $\mathbf{G}$).
+
+$\mathbf{A}$ and $\mathbf{A}_{22}$ are symmetric positive definite, so they are inverted with `chol2inv(chol())`. 
+
+Then, $\mathbf{H}^{-1}$ is $\mathbf{A}^{-1}$ plus $\mathbf{G}_w^{-1} - \mathbf{A}_{22}^{-1}$ in the block of the genotyped animals (`a2_ids`).
+```{r}
+A_inv <- chol2inv(chol(A_ord)) # A^-1.
+A22_inv <- chol2inv(chol(A22)) # (A22)^-1.
+dimnames(A_inv) <- dimnames(A_ord)
+dimnames(A22_inv) <- dimnames(A22)
+
+Hinv <- A_inv
+Hinv[a2_ids, a2_ids] <- Hinv[a2_ids, a2_ids] + Gw_inv - A22_inv
+dim(Hinv)
+```
+
+Note: $\mathbf{A}^{-1}$ is obtained here by inverting the dense $\mathbf{A}$ (fine for `r nrow(A_ord)` animals). For large pedigrees, $\mathbf{A}^{-1}$ is built directly from the pedigree (Henderson's rules), because it is sparse: here only `r round(100 * mean(abs(A_inv) > 1e-10), 2)`% of its elements are not zero.
+
+Checks:
+
+1. $\mathbf{H}^{-1}$ is symmetric, with the animals in the order of $\mathbf{A}_{\text{ord}}$.
+2. Only the block of the genotyped animals differs from $\mathbf{A}^{-1}$.
+3. $\mathbf{H}^{-1}$ is the inverse of $\mathbf{H}$. $\mathbf{H}$ is built from the full expression of $\text{Var}\left[\mathbf{a}\right]$ (with $\mathbf{G} = \mathbf{G}_w$), written compactly as $\mathbf{H} = \mathbf{A} + \begin{pmatrix} \mathbf{D} \\ \mathbf{I} \end{pmatrix}\left(\mathbf{G}_w - \mathbf{A}_{22}\right)\begin{pmatrix} \mathbf{D} \\ \mathbf{I} \end{pmatrix}^\top$, with $\mathbf{D} = \mathbf{A}_{12}\mathbf{A}_{22}^{-1}$ (see Variance of $\mathbf{a}$). Multiplying out gives the four blocks $\mathbf{H}_{11}$, $\mathbf{H}_{12}$, $\mathbf{H}_{21}$ and $\mathbf{H}_{22} = \mathbf{G}_w$.
+```{r}
+stopifnot(isSymmetric(Hinv), identical(dimnames(Hinv), dimnames(A_ord)))
+stopifnot(identical(rownames(Gw_inv), a2_ids), identical(rownames(A22_inv), a2_ids))
+stopifnot(identical(Hinv[a1_ids, ], A_inv[a1_ids, ])) # Rows of non-genotyped animals unchanged.
+
+DI <- rbind(A12 %*% A22_inv, diag(length(a2_ids))) # (D ; I), rows in the order of A_ord.
+H <- A_ord + DI %*% (Gw - A22) %*% t(DI)
+stopifnot(isTRUE(all.equal(H[a2_ids, a2_ids], Gw, check.attributes = FALSE))) # H22 = Gw.
+err <- max(abs(Hinv %*% H - diag(nrow(H))))
+err # H^-1 H = I (up to rounding).
+stopifnot(err < 1e-8)
+rm(DI)
+```
+
+
+# Mixed model equations
+
+As mentioned at the beginning (see Working model), the model is:
+$$
+\begin{pmatrix}
+\mathbf{y}_1 \\
+\mathbf{y}_2
+\end{pmatrix} =
+\mathbf{X}
+\mathbf{b} +
+\begin{pmatrix}
+\mathbf{W}_1 & \mathbf{0} \\
+\mathbf{0} &  \mathbf{W}_2
+\end{pmatrix}
+\begin{pmatrix}
+\mathbf{a}_1 \\
+\mathbf{a}_2
+\end{pmatrix} +
+\mathbf{e}
+$$
+Which, in compact matrix notation, is:
+$$
+\mathbf{y} = \mathbf{Xb} + \mathbf{Wa} + \mathbf{e}
+$$
+
+The assumptions are:
+$$
+\mathbf{a} \sim N\left(\mathbf{0}, \  \mathbf{H} \sigma^2_a\right) \\ \
+\mathbf{H} \sigma^2_a = \mathbf{Q} \in \mathbb{R}^{K \times K} \\ \ \\ \
+\mathbf{e} \sim N\left(\mathbf{0}, \ \mathbf{I} \sigma^2_e\right) \\ \
+\mathbf{I} \sigma^2_e = \mathbf{R} \in \mathbb{R}^{N \times N} \\ \ \\ \
+\text{Cov}\left[\mathbf{a}, \mathbf{e}^\top\right] = \mathbf{0}
+$$
+
+Where $K$ is the number of animals in $\mathbf{a}$ (all animals in the pedigree) and $N$ the number of phenotypes.
+
+
+Then, the mixed model equations (MME; Henderson, 1984) are:
+$$
+\begin{pmatrix}
+\mathbf{X^\top} \mathbf{R}^{-1}  \mathbf{X} &
+\mathbf{X^\top} \mathbf{R}^{-1}  \mathbf{W} \\
+\mathbf{W^\top} \mathbf{R}^{-1}  \mathbf{X} &
+\mathbf{W^\top} \mathbf{R}^{-1}  \mathbf{W} + \mathbf{H}^{-1} \frac{1}{\sigma^2_a}
+\end{pmatrix}
+\begin{pmatrix}
+\widehat{\mathbf{b}} \\
+\widehat{\mathbf{a}}
+\end{pmatrix}
+=
+\begin{pmatrix}
+\mathbf{X^\top} \mathbf{R}^{-1}  \mathbf{y} \\
+\mathbf{W^\top} \mathbf{R}^{-1}  \mathbf{y}
+\end{pmatrix}
+$$
+
+Where $\mathbf{H}^{-1}\frac{1}{\sigma^2_a} = \left(\mathbf{H}\sigma^2_a\right)^{-1} = \mathbf{Q}^{-1}$. And:
+$$
+\mathbf{R}^{-1} = \left(\mathbf{I}\sigma^2_e\right)^{-1} = 
+\mathbf{I}^{-1} \frac{1}{\sigma^2_e} =
+\mathbf{I} \frac{1}{\sigma^2_e}
+$$
+
+Then the equation becomes:
+$$
+\begin{pmatrix}
+\mathbf{X^\top} \frac{1}{\sigma^2_e}  \mathbf{X} &
+\mathbf{X^\top} \frac{1}{\sigma^2_e}  \mathbf{W} \\
+\mathbf{W^\top} \frac{1}{\sigma^2_e}  \mathbf{X} &
+\mathbf{W^\top} \frac{1}{\sigma^2_e}  \mathbf{W} + \mathbf{H}^{-1} \frac{1}{\sigma^2_a}
+\end{pmatrix}
+\begin{pmatrix}
+\widehat{\mathbf{b}} \\
+\widehat{\mathbf{a}}
+\end{pmatrix}
+=
+\begin{pmatrix}
+\mathbf{X^\top} \frac{1}{\sigma^2_e}  \mathbf{y} \\
+\mathbf{W^\top} \frac{1}{\sigma^2_e}  \mathbf{y}
+\end{pmatrix}
+$$
+
+Multiplying both sides by $\sigma^2_e$ cancels the residual variance in the denominators:
+$$
+\begin{pmatrix}
+\mathbf{X^\top}  \mathbf{X} &
+\mathbf{X^\top}  \mathbf{W} \\
+\mathbf{W^\top}  \mathbf{X} &
+\mathbf{W^\top}  \mathbf{W} + \mathbf{H}^{-1} \frac{\sigma^2_e}{\sigma^2_a}
+\end{pmatrix}
+\begin{pmatrix}
+\widehat{\mathbf{b}} \\
+\widehat{\mathbf{a}}
+\end{pmatrix}
+=
+\begin{pmatrix}
+\mathbf{X^\top}  \mathbf{y} \\
+\mathbf{W^\top}  \mathbf{y}
+\end{pmatrix}
+$$
+
+Where $\alpha = \frac{\sigma^2_e}{\sigma^2_a}$. With heritability $h^2 = \frac{\sigma^2_a}{\sigma^2_a + \sigma^2_e}$, $\alpha = \frac{1 - h^2}{h^2}$.
+
+# Restricted Maximum Likelihood
+
+The MME need $\alpha = \sigma^2_e / \sigma^2_a$. Then, the variance components $\boldsymbol{\theta} = \left(\sigma^2_a, \sigma^2_e\right)^\top$ must be estimated first. The standard method is restricted (or residual) maximum likelihood, REML (Patterson and Thompson, 1971).
+
+## Why REML and not ML
+
+Under the model, $\mathbf{y} \sim N\left(\mathbf{Xb}, \mathbf{V}\right)$, with:
+$$
+\mathbf{V} = \text{Var}\left[\mathbf{y}\right] = \text{Var}\left[\mathbf{Wa} + \mathbf{e}\right] = \mathbf{W}\mathbf{H}\mathbf{W}^\top\sigma^2_a + \mathbf{I}\sigma^2_e
+$$
+Because $\mathbf{a}$ and $\mathbf{e}$ are independent. $\mathbf{W}$ ($N \times K$) has one 1 per row, in the column of the animal with the record. Then, $\mathbf{W}\mathbf{H}\mathbf{W}^\top$ is the block of $\mathbf{H}$ for the phenotyped animals, in the order of $\mathbf{y}$.
+
+Maximum likelihood (ML) maximizes the likelihood of $\mathbf{y}$ as if $\mathbf{b}$ were known. It ignores that $\mathbf{b}$ is estimated from the same data, so the variances are biased downwards. For example, in $\mathbf{y} = \mathbf{Xb} + \mathbf{e}$, ML gives $\hat{\sigma}^2_e = \text{SSE}/N$ instead of $\text{SSE}/(N - p)$.
+
+REML uses only the part of the data that is free of $\mathbf{b}$. Let $\mathbf{S}$ be any $N \times (N - p)$ matrix of full column rank with $\mathbf{S}^\top\mathbf{X} = \mathbf{0}$ (for example, $N - p$ linearly independent columns of $\mathbf{I} - \mathbf{X}\left(\mathbf{X}^\top\mathbf{X}\right)^{-1}\mathbf{X}^\top$). Each element of $\mathbf{S}^\top\mathbf{y}$ is a linear combination of the records in which the fixed effects cancel out (an error contrast):
+$$
+\mathbf{S}^\top\mathbf{y} = \mathbf{S}^\top\mathbf{Xb} + \mathbf{S}^\top\left(\mathbf{Wa} + \mathbf{e}\right) = \mathbf{S}^\top\left(\mathbf{Wa} + \mathbf{e}\right) \sim N\left(\mathbf{0}, \mathbf{S}^\top\mathbf{V}\mathbf{S}\right)
+$$
+REML is ML applied to $\mathbf{S}^\top\mathbf{y}$ instead of $\mathbf{y}$. Its distribution does not depend on $\mathbf{b}$, and the $p$ degrees of freedom used by the fixed effects are accounted for ($N - p$ contrasts instead of $N$ records). The result does not depend on the choice of $\mathbf{S}$, and $\mathbf{S}$ is never computed: the REML log-likelihood below is written with $\mathbf{V}$ and $\mathbf{X}$ only.
+
+## REML log-likelihood
+
+$$
+L(\boldsymbol{\theta}) = -\frac{1}{2}\left[
+\log\left|\mathbf{V}\right| +
+\log\left|\mathbf{X}^\top\mathbf{V}^{-1}\mathbf{X}\right| +
+\mathbf{y}^\top\mathbf{P}\mathbf{y}
+\right] + \text{constant}
+$$
+
+Where $\mathbf{P}$ is the projection matrix:
+$$
+\mathbf{P} = \mathbf{V}^{-1} - \mathbf{V}^{-1}\mathbf{X}\left(\mathbf{X}^\top\mathbf{V}^{-1}\mathbf{X}\right)^{-1}\mathbf{X}^\top\mathbf{V}^{-1}
+$$
+
+$\mathbf{P}\mathbf{X} = \mathbf{0}$, so $\mathbf{P}$ removes the fixed effects, and $\mathbf{P}\mathbf{y} = \mathbf{V}^{-1}\left(\mathbf{y} - \mathbf{X}\hat{\mathbf{b}}\right)$, where $\hat{\mathbf{b}}$ is the generalized least squares solution ($\mathbf{X}^\top\mathbf{V}^{-1}\mathbf{X}\hat{\mathbf{b}} = \mathbf{X}^\top\mathbf{V}^{-1}\mathbf{y}$). The three terms of $L$ are:
+
+1. $\mathbf{y}^\top\mathbf{P}\mathbf{y} = \left(\mathbf{y} - \mathbf{X}\hat{\mathbf{b}}\right)^\top\mathbf{V}^{-1}\left(\mathbf{y} - \mathbf{X}\hat{\mathbf{b}}\right)$: a weighted sum of squares of residuals.
+2. $\log\left|\mathbf{V}\right|$: depends only on the variance structure.
+3. $\log\left|\mathbf{X}^\top\mathbf{V}^{-1}\mathbf{X}\right|$: a penalty for estimating $\mathbf{b}$. This is the term that ML does not have.
+
+## Maximizing $L$
+
+$L$ has no closed-form maximum, so $\boldsymbol{\theta}$ is found iteratively from the derivatives of $L$. $\mathbf{V}$ is linear in $\boldsymbol{\theta}$, with:
+$$
+\mathbf{V}_a = \frac{\partial \mathbf{V}}{\partial \sigma^2_a} = \mathbf{W}\mathbf{H}\mathbf{W}^\top \\ \
+\mathbf{V}_e = \frac{\partial \mathbf{V}}{\partial \sigma^2_e} = \mathbf{I}
+$$
+
+First derivatives (score), for $i \in \{a, e\}$:
+$$
+\frac{\partial L}{\partial \theta_i} =
+-\frac{1}{2}\left[
+\text{tr}\left(\mathbf{P}\mathbf{V}_i\right) -
+\mathbf{y}^\top\mathbf{P}\mathbf{V}_i\mathbf{P}\mathbf{y}
+\right]
+$$
+
+At the maximum the score is zero: the quadratic form of the data, $\mathbf{y}^\top\mathbf{P}\mathbf{V}_i\mathbf{P}\mathbf{y}$, equals its expected value, $\text{tr}\left(\mathbf{P}\mathbf{V}_i\right)$.
+
+Second derivatives. There are three versions of the information matrix ($2 \times 2$), with elements:
+
+| Information | Element $(i, j)$ | Method |
+|:---|:---|:---|
+| Observed, $-\partial^2 L / \partial\theta_i\partial\theta_j$ | $\mathbf{y}^\top\mathbf{P}\mathbf{V}_i\mathbf{P}\mathbf{V}_j\mathbf{P}\mathbf{y} - \frac{1}{2}\text{tr}\left(\mathbf{P}\mathbf{V}_i\mathbf{P}\mathbf{V}_j\right)$ | Newton-Raphson |
+| Expected (Fisher) | $\frac{1}{2}\text{tr}\left(\mathbf{P}\mathbf{V}_i\mathbf{P}\mathbf{V}_j\right)$ | Fisher scoring |
+| Average (AI) | $\frac{1}{2}\mathbf{y}^\top\mathbf{P}\mathbf{V}_i\mathbf{P}\mathbf{V}_j\mathbf{P}\mathbf{y}$ | AI-REML (Gilmour et al., 1995) |
+
+The AI matrix is the average of the observed and the expected information. It has no trace terms, so it is cheap to compute. Each iteration updates $\boldsymbol{\theta}$ as:
+$$
+\boldsymbol{\theta}^{(t+1)} = \boldsymbol{\theta}^{(t)} + \left(\mathbf{AI}^{(t)}\right)^{-1} \frac{\partial L}{\partial \boldsymbol{\theta}}\bigg|_{\boldsymbol{\theta}^{(t)}}
+$$
+
+At convergence, $\text{Var}\left[\hat{\boldsymbol{\theta}}\right] \approx \mathbf{AI}^{-1}$, which gives the standard errors of the estimates.
+
+## Computing $L$ and its derivatives from the MME
+
+When $N$ is large, $\mathbf{V}$ ($N \times N$) is too large to invert. Then, everything is obtained from the MME (see Mixed model equations), with $\mathbf{T} = \begin{pmatrix} \mathbf{X} & \mathbf{W} \end{pmatrix}$ and the coefficient matrix:
+$$
+\mathbf{C} =
+\begin{pmatrix}
+\mathbf{X}^\top\mathbf{X} & \mathbf{X}^\top\mathbf{W} \\
+\mathbf{W}^\top\mathbf{X} & \mathbf{W}^\top\mathbf{W} + \mathbf{H}^{-1}\alpha
+\end{pmatrix}
+$$
+
+The key identity is:
+$$
+\mathbf{P} = \frac{1}{\sigma^2_e}\left(\mathbf{I} - \mathbf{T}\mathbf{C}^{-1}\mathbf{T}^\top\right)
+$$
+
+With the MME solutions $\hat{\mathbf{b}}$ and $\hat{\mathbf{a}}$, and the residuals $\hat{\mathbf{e}} = \mathbf{y} - \mathbf{X}\hat{\mathbf{b}} - \mathbf{W}\hat{\mathbf{a}}$, it gives:
+$$
+\mathbf{P}\mathbf{y} = \frac{\hat{\mathbf{e}}}{\sigma^2_e} \\ \
+\mathbf{y}^\top\mathbf{P}\mathbf{y} = \frac{\mathbf{y}^\top\hat{\mathbf{e}}}{\sigma^2_e}
+$$
+
+**Log-likelihood** (e.g., Meyer, 1989), where $p$ is the number of columns of $\mathbf{X}$ (full rank) and $\log\left|\mathbf{H}\right|$ goes into the constant:
+$$
+-2L = (N - p - K)\log\sigma^2_e + K\log\sigma^2_a + \log\left|\mathbf{C}\right| + \frac{\mathbf{y}^\top\hat{\mathbf{e}}}{\sigma^2_e} + \text{constant}
+$$
+
+**Score.** $\mathbf{C}^{22}$ is the block of $\mathbf{C}^{-1}$ for $\mathbf{a}$, with $\text{Var}\left[\mathbf{a} - \hat{\mathbf{a}}\right] = \mathbf{C}^{22}\sigma^2_e$ (prediction error variance, PEV):
+$$
+\frac{\partial L}{\partial \sigma^2_a} =
+\frac{1}{2}\left[
+\frac{\hat{\mathbf{a}}^\top\mathbf{H}^{-1}\hat{\mathbf{a}}}{\sigma^4_a} -
+\frac{K}{\sigma^2_a} +
+\frac{\text{tr}\left(\mathbf{H}^{-1}\mathbf{C}^{22}\right)\sigma^2_e}{\sigma^4_a}
+\right] \\ \ \\ \
+\frac{\partial L}{\partial \sigma^2_e} =
+\frac{1}{2}\left[
+\frac{\hat{\mathbf{e}}^\top\hat{\mathbf{e}}}{\sigma^4_e} -
+\frac{N - p - K}{\sigma^2_e} -
+\frac{\text{tr}\left(\mathbf{H}^{-1}\mathbf{C}^{22}\right)}{\sigma^2_a}
+\right]
+$$
+
+**AI matrix.** The vectors $\mathbf{V}_i\mathbf{P}\mathbf{y}$ are:
+$$
+\mathbf{V}_a\mathbf{P}\mathbf{y} = \frac{\mathbf{W}\hat{\mathbf{a}}}{\sigma^2_a} \\ \
+\mathbf{V}_e\mathbf{P}\mathbf{y} = \frac{\hat{\mathbf{e}}}{\sigma^2_e}
+$$
+
+With $\mathbf{F} = \begin{pmatrix} \mathbf{W}\hat{\mathbf{a}}/\sigma^2_a & \hat{\mathbf{e}}/\sigma^2_e \end{pmatrix}$ ($N \times 2$), $\mathbf{AI} = \frac{1}{2}\mathbf{F}^\top\mathbf{P}\mathbf{F}$, and by the key identity:
+$$
+\mathbf{AI} = \frac{1}{2\sigma^2_e}\left(\mathbf{F}^\top\mathbf{F} - \mathbf{F}^\top\mathbf{T}\mathbf{C}^{-1}\mathbf{T}^\top\mathbf{F}\right)
+$$
+
+That is, the MME are solved with the two columns of $\mathbf{F}$ in place of $\mathbf{y}$ (right-hand side $\mathbf{T}^\top\mathbf{F}$).
+
+## EM-REML
+
+Setting both scores to zero and rearranging gives (Mrode, 2014, Eqns 17.5 and 17.6):
+$$
+\sigma^2_e = \frac{\mathbf{y}^\top\hat{\mathbf{e}}}{N - p} \\ \ \\ \
+\sigma^2_a = \frac{\hat{\mathbf{a}}^\top\mathbf{H}^{-1}\hat{\mathbf{a}} + \text{tr}\left(\mathbf{H}^{-1}\mathbf{C}^{22}\right)\sigma^2_e}{K}
+$$
+
+Used as an update (right-hand sides computed with the current $\boldsymbol{\theta}$), this is the EM algorithm (Dempster et al., 1977): $\sigma^2_e$ comes from the residuals, and $\sigma^2_a$ from the predicted breeding values plus their PEV. The estimates always stay positive, but convergence is slow. AI-REML converges in a few iterations, but an update can give a negative variance. Then, a common strategy is to start with a few EM iterations, or to use an EM step when the AI step goes out of the parameter space.
+
+## AI-REML algorithm
+
+1. Start values. For example, from a guess of heritability $h^2_0$ and the phenotypic variance $\sigma^2_y$: $\sigma^2_a = h^2_0\sigma^2_y$ and $\sigma^2_e = \left(1 - h^2_0\right)\sigma^2_y$.
+2. Compute what $L$, the score and the AI matrix need: $\mathbf{V}$ and $\mathbf{P}$ (if $N$ is small), or the MME solutions $\hat{\mathbf{b}}$, $\hat{\mathbf{a}}$, $\hat{\mathbf{e}}$ and $\mathbf{C}^{22}$, with $\alpha = \sigma^2_e / \sigma^2_a$ (if $N$ is large).
+3. Compute $L$, the score and the AI matrix.
+4. Update $\boldsymbol{\theta}$. A variance cannot be negative: if the update makes it negative, it is set to a small positive value (the boundary), and it stays there while its score is negative. An EM step is an alternative.
+5. Repeat steps 2 to 4 until convergence (changes in $L$ and $\boldsymbol{\theta}$ below a small tolerance, e.g., $10^{-6}$).
+6. Report $\hat{\sigma}^2_a$ and $\hat{\sigma}^2_e$, their standard errors from $\mathbf{AI}^{-1}$, and the heritability $\hat{h}^2 = \hat{\sigma}^2_a / \left(\hat{\sigma}^2_a + \hat{\sigma}^2_e\right)$ (standard error by the delta method).
+
+Note on Mrode (2014, Chapter 17): two formulas there seem to have misprints. $\mathbf{P}$ is printed without the first $\mathbf{V}^{-1}$ in the second term, and in Eqns 17.2 and 17.3 some signs and powers of the variances differ from the ones above. The expressions here are consistent with Eqns 17.5 and 17.6, and were checked numerically.
+
+## AI-REML algorithm: implementation
+
+**Which route.** Here there are $N$ = `r length(y)` records, but $K + p$ = `r K + ncol(X_ord)` equations in the MME. Factorizing $\mathbf{V}$ ($N \times N$) is much cheaper than factorizing $\mathbf{C}$, so $L$, the score and the AI matrix are computed directly with the formulas of Maximizing $L$: each line of code below is one formula. The MME route (Computing $L$ and its derivatives from the MME) gives the same numbers, and it is used below as a check. With many records (large $N$), the MME route, with sparse matrices, is the one to use.
+
+### Data for REML
+
+REML needs only $\mathbf{y}$, $\mathbf{X}$ and $\mathbf{W}\mathbf{H}\mathbf{W}^\top$: $\mathbf{V}$ depends on $\mathbf{H}$ only through the phenotyped animals. $\mathbf{y}$ and $\mathbf{X}_{\text{ord}}$ are already aligned (see Align data with the ordered $\mathbf{A}$), and $\mathbf{H}$ was built in Calculation of $\mathbf{H}^{-1}$ (check 3).
+```{r}
+Hyy <- H[y_ids, y_ids] # W H W': block of H for the phenotyped animals, in the order of y.
+stopifnot(identical(rownames(Hyy), names(y)), identical(rownames(X_ord), names(y)))
+n_b <- ncol(X_ord)     # p in the formulas (`p` is already used for the allele frequencies).
+c(N = length(y), p = n_b, K = K)
+```
+
+### Steps 2 and 3: $L$, score and AI matrix for a given $\boldsymbol{\theta}$
+
+`reml_terms()` takes $\boldsymbol{\theta} = (\sigma^2_a, \sigma^2_e)$ and returns $L$, the score and the AI matrix. Two computational details:
+
+- $\log\left|\mathbf{V}\right| = 2\sum_i \log u_{ii}$, where $\mathbf{U}$ is the Cholesky factor of $\mathbf{V}$ ($\mathbf{V} = \mathbf{U}^\top\mathbf{U}$). The same factor gives $\mathbf{V}^{-1}$ (`chol2inv()`).
+- $\text{tr}\left(\mathbf{P}\mathbf{V}_a\right) = \sum_{ij} p_{ij}\left(\mathbf{W}\mathbf{H}\mathbf{W}^\top\right)_{ij}$, because both matrices are symmetric. This avoids the matrix product.
+```{r}
+reml_terms <- function(theta, y, X, Hyy) {
+  sa <- theta[["sa"]] # sigma2_a
+  se <- theta[["se"]] # sigma2_e
+  N <- length(y)
+
+  # V = W H W' sigma2_a + I sigma2_e, and V^-1 from its Cholesky factor (V = U'U).
+  V <- sa * Hyy + se * diag(N)
+  U <- chol(V)
+  Vi <- chol2inv(U)
+
+  # P = V^-1 - V^-1 X (X' V^-1 X)^-1 X' V^-1
+  ViX <- Vi %*% X
+  XViX <- crossprod(X, ViX)
+  P <- Vi - ViX %*% solve(XViX, t(ViX))
+  Py <- drop(P %*% y)
+
+  # L = -1/2 [log|V| + log|X' V^-1 X| + y' P y]
+  logL <- -0.5 * (2 * sum(log(diag(U))) + c(determinant(XViX)$modulus) + sum(y * Py))
+
+  # V_i P y, with V_a = W H W' and V_e = I.
+  VaPy <- drop(Hyy %*% Py)
+  VePy <- Py
+
+  # Score: dL/dtheta_i = -1/2 [tr(P V_i) - y' P V_i P y]
+  score <- -0.5 * c(sa = sum(P * Hyy) - sum(Py * VaPy),
+                    se = sum(diag(P)) - sum(Py * VePy))
+
+  # AI_ij = 1/2 y' P V_i P V_j P y = 1/2 F' P F, with F = (V_a P y, V_e P y).
+  Fm <- cbind(sa = VaPy, se = VePy)
+  AI <- 0.5 * crossprod(Fm, P %*% Fm)
+
+  list(logL = logL, score = score, AI = AI)
+}
+```
+
+### Steps 1, 4 and 5: start values and iterations
+
+`ai_reml()` runs the algorithm:
+
+1. **Start values.** $\sigma^2_y$ is the residual variance of $\mathbf{y}$ after fitting only the fixed effects (ordinary least squares), and $h^2_0 = 0.3$.
+4. **Update.** $\boldsymbol{\theta} \leftarrow \boldsymbol{\theta} + \mathbf{AI}^{-1}\,\partial L / \partial\boldsymbol{\theta}$. A variance cannot be negative: if the update makes it $\le 0$, it is set to a small positive value, $\epsilon = 10^{-8}\sigma^2_y$ (the boundary). While a variance is at the boundary and its score is negative ($L$ would only increase if the variance were negative), it stays fixed, and only the other variance is updated, with its own element of $\mathbf{AI}$.
+5. **Convergence.** Stop when the change in $\boldsymbol{\theta}$ (relative to $\sigma^2_y$) and the change in $L$ are both below $10^{-8}$.
+```{r}
+ai_reml <- function(y, X, Hyy, h2_0 = 0.3, tol = 1e-8, max_iter = 100) {
+  # Step 1: start values.
+  ols <- lm.fit(X, y)
+  s2y <- sum(ols$residuals^2) / (length(y) - ncol(X))
+  theta <- c(sa = h2_0 * s2y, se = (1 - h2_0) * s2y)
+  eps <- 1e-8 * s2y # Boundary: smallest value allowed for a variance.
+
+  history <- NULL
+  logL_old <- -Inf
+  converged <- FALSE
+  for (iter in seq_len(max_iter)) {
+    # Steps 2 and 3: L, score and AI matrix at the current theta.
+    r <- reml_terms(theta, y, X, Hyy)
+    history <- rbind(history, data.frame(iter = iter, sigma2_a = theta[["sa"]], sigma2_e = theta[["se"]],
+                                         h2 = theta[["sa"]] / sum(theta), logL = r$logL))
+
+    # Step 4: AI update. A variance at the boundary with a negative score stays fixed.
+    free <- !(theta <= eps & r$score < 0)
+    step <- c(sa = 0, se = 0)
+    step[free] <- solve(r$AI[free, free, drop = FALSE], r$score[free])
+    theta_new <- pmax(theta + step, eps)
+
+    # Step 5: convergence.
+    converged <- max(abs(theta_new - theta)) < tol * s2y && abs(r$logL - logL_old) < tol
+    theta <- theta_new
+    logL_old <- r$logL
+    if (converged) break
+  }
+
+  list(theta = theta, converged = converged, history = history,
+       at_boundary = theta <= eps, AI = reml_terms(theta, y, X, Hyy)$AI)
+}
+```
+
+Run AI-REML on `delta`. Each row of the history is one iteration.
+```{r}
+reml <- ai_reml(y, X_ord, Hyy)
+stopifnot(reml$converged)
+reml$history
+```
+
+### Step 6: estimates and standard errors
+
+At convergence, $\text{Var}\left[\hat{\boldsymbol{\theta}}\right] \approx \mathbf{AI}^{-1}$. The standard error of $\hat{h}^2 = \hat{\sigma}^2_a / (\hat{\sigma}^2_a + \hat{\sigma}^2_e)$ comes from the delta method: $\text{Var}\left[\hat{h}^2\right] \approx \mathbf{g}^\top\mathbf{AI}^{-1}\mathbf{g}$, with $\mathbf{g} = \partial h^2 / \partial\boldsymbol{\theta} = \left(\sigma^2_e, -\sigma^2_a\right)^\top / \left(\sigma^2_a + \sigma^2_e\right)^2$. If a variance is at the boundary, this large-sample theory does not apply: its standard error (and that of $\hat{h}^2$) is not reported (`NA`), and the other standard error uses only its own element of $\mathbf{AI}$.
+```{r}
+theta_hat <- reml$theta
+free <- !reml$at_boundary
+h2_hat <- theta_hat[["sa"]] / sum(theta_hat)
+
+SE <- c(sa = NA, se = NA)
+SE[free] <- sqrt(diag(solve(reml$AI[free, free, drop = FALSE])))
+g_h2 <- c(theta_hat[["se"]], -theta_hat[["sa"]]) / sum(theta_hat)^2
+SE_h2 <- if (all(free)) sqrt(drop(t(g_h2) %*% solve(reml$AI) %*% g_h2)) else NA
+
+data.frame(parameter = c('sigma2_a', 'sigma2_e', 'h2'),
+           estimate = c(theta_hat[["sa"]], theta_hat[["se"]], h2_hat),
+           SE = c(SE[["sa"]], SE[["se"]], SE_h2),
+           at_boundary = c(reml$at_boundary[["sa"]], reml$at_boundary[["se"]], reml$at_boundary[["sa"]]))
+```
+
+With the current data, $\sigma^2_a$ goes to the boundary: the REML estimate of $h^2$ for `delta` is 0. Then, $\hat{\sigma}^2_e$ is the residual variance of the model with only the fixed effects, as expected (with $\sigma^2_a = 0$, $\mathbf{V} = \mathbf{I}\sigma^2_e$). The profile log-likelihood shows it: for each $h^2$, $L$ is maximized over the total variance $\sigma^2_a + \sigma^2_e$, and $L$ decreases as $h^2$ increases.
+```{r}
+h2_grid <- c(0, 0.01, 0.05, seq(0.1, 0.9, by = 0.1))
+prof_logL <- sapply(h2_grid, function(h2) {
+  logL_s2p <- function(s2p) reml_terms(c(sa = h2 * s2p, se = (1 - h2) * s2p), y, X_ord, Hyy)$logL
+  optimize(logL_s2p, interval = c(0.1, 10) * var(y), maximum = TRUE)$objective
+})
+plot(h2_grid, prof_logL, type = 'b', pch = 19, xlab = expression(h^2),
+     ylab = 'REML log-likelihood (profile)')
+abline(v = h2_hat, lty = 2, col = 'red')
+```
+
+### Checks
+
+**1. The MME route gives the same $L$ and score.** At the start values, $L$ and the score are computed again with the formulas of Computing $L$ and its derivatives from the MME (including $\log\left|\mathbf{H}\right|$, so that both $L$ are equal, not only up to a constant).
+```{r}
+theta_0 <- c(sa = reml$history$sigma2_a[1], se = reml$history$sigma2_e[1])
+sa <- theta_0[["sa"]]
+se <- theta_0[["se"]]
+
+# W (N x K): one 1 per row, in the column of the animal with the record (order of A_ord).
+W <- matrix(0, nrow = length(y), ncol = K, dimnames = list(names(y), rownames(A_ord)))
+W[cbind(seq_along(y), match(names(y), rownames(A_ord)))] <- 1
+Tm <- cbind(X_ord, W) # T = (X W)
+stopifnot(identical(colnames(W), rownames(Hinv)))
+
+# C = T'T + blockdiag(0, H^-1 alpha), and its inverse.
+ia <- n_b + seq_len(K) # Rows and columns of a in C.
+C_mme <- crossprod(Tm)
+C_mme[ia, ia] <- C_mme[ia, ia] + Hinv * (se / sa)
+U_C <- chol(C_mme)
+C_inv <- chol2inv(U_C)
+
+# MME solutions, residuals and C22.
+sol <- drop(C_inv %*% crossprod(Tm, y))
+a_hat <- sol[ia]
+e_hat <- drop(y - Tm %*% sol)
+tr_HiC22 <- sum(Hinv * C_inv[ia, ia]) # tr(H^-1 C22)
+aHia <- sum(a_hat * (Hinv %*% a_hat))  # a' H^-1 a
+logdet_H <- -c(determinant(Hinv)$modulus)
+
+logL_mme <- -0.5 * ((length(y) - n_b - K) * log(se) + K * log(sa) + logdet_H +
+                      2 * sum(log(diag(U_C))) + sum(y * e_hat) / se)
+score_mme <- c(sa = 0.5 * (aHia / sa^2 - K / sa + tr_HiC22 * se / sa^2),
+               se = 0.5 * (sum(e_hat^2) / se^2 - (length(y) - n_b - K) / se - tr_HiC22 / sa))
+
+r_0 <- reml_terms(theta_0, y, X_ord, Hyy)
+rbind(V_route = c(logL = r_0$logL, r_0$score), MME_route = c(logL = logL_mme, score_mme))
+stopifnot(abs(r_0$logL - logL_mme) < 1e-6, max(abs(r_0$score - score_mme)) < 1e-6)
+rm(W, Tm, C_mme, U_C, C_inv)
+```
+
+**2. A general-purpose optimizer finds the same maximum.** `optim()` maximizes $L$ directly (without derivatives), with $\sigma^2_a, \sigma^2_e \ge 0$.
+```{r}
+opt <- optim(par = theta_0, method = 'L-BFGS-B', lower = c(0, 1e-8),
+             fn = function(t) -reml_terms(c(sa = t[[1]], se = t[[2]]), y, X_ord, Hyy)$logL)
+rbind(AI_REML = c(theta_hat, logL = reml_terms(theta_hat, y, X_ord, Hyy)$logL),
+      optim = c(opt$par, logL = -opt$value))
+stopifnot(reml_terms(theta_hat, y, X_ord, Hyy)$logL >= -opt$value - 1e-6)
+```
+
+**3. The code recovers known variances.** Data are simulated with the same $\mathbf{X}$ and $\mathbf{H}$, with $\sigma^2_a = 6$ and $\sigma^2_e = 9$ ($h^2 = 0.4$), and AI-REML is run on each simulated data set. If $\mathbf{z} \sim N(\mathbf{0}, \mathbf{I})$, then $\mathbf{U}^\top\mathbf{z} \sim N(\mathbf{0}, \mathbf{W}\mathbf{H}\mathbf{W}^\top)$, where $\mathbf{U}$ is the Cholesky factor of $\mathbf{W}\mathbf{H}\mathbf{W}^\top$. The fixed effects do not change the REML estimates, so all are set to 1. The mean of the estimates should be close to the true values (REML is not exactly unbiased in small samples).
+```{r}
+set.seed(2026)
+theta_true <- c(sa = 6, se = 9)
+U_H <- chol(Hyy)
+sim <- t(replicate(100, {
+  a_sim <- sqrt(theta_true[["sa"]]) * drop(crossprod(U_H, rnorm(length(y))))
+  e_sim <- sqrt(theta_true[["se"]]) * rnorm(length(y))
+  y_sim <- drop(X_ord %*% rep(1, n_b)) + a_sim + e_sim
+  fit_sim <- ai_reml(y_sim, X_ord, Hyy)
+  c(fit_sim$theta, h2 = fit_sim$theta[["sa"]] / sum(fit_sim$theta))
+}))
+rbind(true = c(theta_true, h2 = 0.4),
+      mean = colMeans(sim),
+      SE_of_mean = apply(sim, 2, sd) / sqrt(nrow(sim)))
+```
+
+
+# Conclusion.
+
+We have few phenotypes. With this low ammount of data, it is impossible to get a reliable estimation of $h^2$. 
+
+The estimated $h^2 \simeq 0$. We do not have enough information to estimate the variance component $\sigma^2_a$.
+
+Subsequent estimations of additive values and propagation to SNP effect is just unreliable and missleading.
+
